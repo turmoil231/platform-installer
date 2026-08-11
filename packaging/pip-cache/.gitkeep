@@ -1,0 +1,7 @@
+# This directory holds pre-downloaded Python wheel files for offline builds.
+# Populate it by running:
+#   ./packaging/seed_pip_cache.sh
+#
+# The wheel files are committed to git so the container build is fully
+# disconnected-safe after the initial seed.
+# Add *.whl to .gitignore if you prefer to store them in Artifactory instead.

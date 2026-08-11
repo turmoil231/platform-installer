@@ -1,0 +1,207 @@
+# .gitlab-ci.yml
+#
+# CI pipeline for platform-installer.
+# Runs on your internal GitLab instance (no external network access from runners).
+#
+# Pipeline stages:
+#   test        → unit + integration tests against the installer Python package
+#   build       → assemble the distribution tarball + container image
+#   publish     → push tarball to Artifactory, image to internal registry
+#
+# Required GitLab CI/CD variables (set in project Settings → CI/CD → Variables):
+#   ARTIFACTORY_URL         https://artifactory.apps.hub.example.internal
+#   ARTIFACTORY_USER        admin
+#   ARTIFACTORY_PASSWORD    (masked)
+#   REGISTRY_URL            registry.example.internal:5000
+#   REGISTRY_USER           push-bot
+#   REGISTRY_PASSWORD       (masked)
+#   GITLAB_TOKEN            (for collection staging from other repos, masked)
+
+default:
+  image: registry.example.internal:5000/platform/python-builder:3.11
+  before_script:
+    - python3 --version
+    - pip --version
+
+variables:
+  PYTHON_VERSION: "3.11"
+  PIP_CACHE_DIR: "${CI_PROJECT_DIR}/packaging/pip-cache"
+
+# Cache pip wheels across jobs on the same branch
+cache:
+  key: "pip-cache-${CI_COMMIT_REF_SLUG}"
+  paths:
+    - packaging/pip-cache/
+
+stages:
+  - test
+  - build
+  - publish
+
+
+# ── Test ──────────────────────────────────────────────────────────────────────
+
+unit-tests:
+  stage: test
+  script:
+    - pip install --quiet -e ".[dev]" --find-links packaging/pip-cache || true
+    - pip install --quiet pytest pytest-mock
+    - pytest tests/unit/ -v --tb=short --junitxml=reports/junit-unit.xml
+  artifacts:
+    when: always
+    reports:
+      junit: reports/junit-unit.xml
+    paths:
+      - reports/
+
+config-validation:
+  stage: test
+  script:
+    - pip install --quiet -e . --find-links packaging/pip-cache || true
+    - platform-installer validate
+        --config platform-config.yaml.example
+        --skip-collection-install
+  allow_failure: false
+
+schema-lint:
+  stage: test
+  script:
+    - pip install --quiet pydantic yamllint
+    - yamllint ansible/playbooks/
+    - yamllint ansible/collections/requirements.yml
+    - python3 -c "
+        from installer.config.loader import ConfigLoader
+        import yaml
+        # Ensure Pydantic models import cleanly
+        from installer.config.models import PlatformConfig
+        print('Schema models OK')
+      "
+
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+
+build-bundle:
+  stage: build
+  needs: [unit-tests, config-validation]
+  script:
+    # Seed pip cache if not already present (CI cache may be cold)
+    - |
+      if [[ $(ls packaging/pip-cache/*.whl 2>/dev/null | wc -l) -lt 5 ]]; then
+        echo "Seeding pip cache ..."
+        ./packaging/seed_pip_cache.sh
+      fi
+
+    # Stage collections from internal GitLab collection repos
+    - ./scripts/stage_collections.sh
+        --staging-root .build
+        --requirements ansible/collections/requirements.yml
+        --lock-file collections.lock.yml
+
+    # Build the distribution tarball
+    - ./packaging/build_bundle.sh
+        --skip-tests
+        --skip-collections
+
+    # Verify the tarball can be extracted and the wrapper runs
+    - |
+      VERSION="$(grep '^version' pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')"
+      EXTRACT_DIR="$(mktemp -d)"
+      tar -xzf "dist/platform-installer-${VERSION}.tar.gz" -C "${EXTRACT_DIR}"
+      "${EXTRACT_DIR}/platform-installer-${VERSION}/platform-installer" --help
+      echo "Bundle smoke test: PASSED"
+
+  artifacts:
+    paths:
+      - dist/
+      - collections.lock.yml
+    expire_in: 30 days
+
+
+build-container:
+  stage: build
+  needs: [unit-tests]
+  image: registry.example.internal:5000/platform/podman-builder:latest
+  script:
+    - |
+      VERSION="$(grep '^version' pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')"
+      IMAGE_TAG="${REGISTRY_URL}/platform/platform-installer:${VERSION}"
+      IMAGE_TAG_LATEST="${REGISTRY_URL}/platform/platform-installer:latest"
+
+      # Stage collections so they can be baked into the image
+      ./scripts/stage_collections.sh \
+        --staging-root . \
+        --requirements ansible/collections/requirements.yml
+
+      # Build the image
+      podman build \
+        --file packaging/Containerfile \
+        --tag "${IMAGE_TAG}" \
+        --tag "${IMAGE_TAG_LATEST}" \
+        --build-arg VERSION="${VERSION}" \
+        .
+
+      # Smoke test the image
+      podman run --rm "${IMAGE_TAG}" --help
+      echo "Container smoke test: PASSED"
+
+      # Save as tarball for air-gap transfer artifact
+      mkdir -p dist
+      podman save "${IMAGE_TAG}" \
+        | gzip > "dist/platform-installer-${VERSION}-container.tar.gz"
+
+  artifacts:
+    paths:
+      - dist/platform-installer-*-container.tar.gz
+    expire_in: 30 days
+
+
+# ── Publish ───────────────────────────────────────────────────────────────────
+
+publish-bundle-to-artifactory:
+  stage: publish
+  needs: [build-bundle]
+  only:
+    - tags                                    # Only publish on tagged releases
+    - main
+  script:
+    - |
+      VERSION="$(grep '^version' pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')"
+      TARBALL="dist/platform-installer-${VERSION}.tar.gz"
+      CHECKSUM="dist/platform-installer-${VERSION}.tar.gz.sha256"
+      REPO_PATH="${ARTIFACTORY_URL}/artifactory/platform-releases/platform-installer/${VERSION}/"
+
+      echo "Publishing ${TARBALL} to Artifactory ..."
+      curl --silent --show-error --fail \
+        --user "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" \
+        --upload-file "${TARBALL}" \
+        "${REPO_PATH}"
+
+      curl --silent --show-error --fail \
+        --user "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" \
+        --upload-file "${CHECKSUM}" \
+        "${REPO_PATH}"
+
+      echo "Published: ${REPO_PATH}"
+
+
+publish-container-to-registry:
+  stage: publish
+  needs: [build-container]
+  only:
+    - tags
+    - main
+  image: registry.example.internal:5000/platform/podman-builder:latest
+  script:
+    - |
+      VERSION="$(grep '^version' pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')"
+      CONTAINER_TAR="dist/platform-installer-${VERSION}-container.tar.gz"
+      IMAGE_TAG="${REGISTRY_URL}/platform/platform-installer:${VERSION}"
+      IMAGE_TAG_LATEST="${REGISTRY_URL}/platform/platform-installer:latest"
+
+      podman load < "${CONTAINER_TAR}"
+      podman login "${REGISTRY_URL}" \
+        --username "${REGISTRY_USER}" \
+        --password "${REGISTRY_PASSWORD}"
+      podman push "${IMAGE_TAG}"
+      podman push "${IMAGE_TAG_LATEST}"
+      echo "Published: ${IMAGE_TAG}"

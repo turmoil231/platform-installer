@@ -1,0 +1,22 @@
+---
+# ansible/playbooks/hub/generate_install_config.yml
+# Run platform.ocp.discover_cluster_facts then render install-config.yaml
+#
+# Variables consumed (from group_vars/generated/):
+#   See CLAUDE.md for the full variable reference.
+#
+# TODO: Implement using roles from the appropriate platform.* collection.
+# Pattern: import_role from the collection, pass vars from platform_* group_vars.
+# Reference: ansible/playbooks/vmware/install_esxi.yml for the calling pattern.
+
+- name: "TODO: Run platform.ocp.discover_cluster_facts then render install-config.yaml"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: "Stub | Not yet implemented"
+      ansible.builtin.fail:
+        msg: >
+          This playbook is a stub and has not been implemented yet.
+          See CLAUDE.md for implementation guidance.

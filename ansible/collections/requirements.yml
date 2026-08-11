@@ -1,0 +1,109 @@
+---
+# ansible/collections/requirements.yml
+#
+# Declares all Ansible collection dependencies for the platform installer.
+# Collections live in separate Git repos — this file is the contract between
+# the installer repo and those collection repos.
+#
+# At build/staging time (connected environment or internal GitLab):
+#   scripts/stage_collections.sh
+#   ... runs `ansible-galaxy collection install -r requirements.yml`
+#   ... against your internal GitLab instance and produces tarballs staged
+#   ... under assets.staging_root/collections/
+#
+# At deploy time (disconnected):
+#   The installer configures ANSIBLE_COLLECTIONS_PATH to point at the
+#   pre-staged tarballs.  No network access is required.
+#
+# Version pins: always pin to a specific version or git ref.
+# Never use '*' or 'latest' — the platform manifest owns all version pins.
+# The versions here must match what is declared in platform-manifest.yaml
+# under collection_versions.
+#
+# Source types:
+#   galaxy:  Internal Automation Hub / Pulp (preferred for released collections)
+#   git:     Direct from your internal GitLab (required for your custom collections)
+#   url:     Pre-built tarball served from Artifactory (fallback / fully offline)
+#
+# In a fully disconnected deployment the installer uses `url` sources pointing
+# at the bootstrap Artifactory instance, which was seeded from staged tarballs.
+# The staging script populates Artifactory; the installer reads from it.
+
+collections:
+
+  # ── Your custom platform collections (separate GitLab repos) ─────────────
+  # These are your Ansible automation — in their own repos, versioned
+  # independently, referenced here by git tag or commit SHA.
+
+  - name: "platform.vmware"
+    source: "https://gitlab.example.internal/platform/ansible-collections/vmware.git"
+    type: git
+    version: "v1.3.0"                       # Git tag — must match manifest
+
+  - name: "platform.ocp"
+    source: "https://gitlab.example.internal/platform/ansible-collections/ocp.git"
+    type: git
+    version: "v2.1.0"
+
+  - name: "platform.storage"
+    source: "https://gitlab.example.internal/platform/ansible-collections/storage.git"
+    type: git
+    version: "v1.0.4"
+
+  - name: "platform.idm"
+    source: "https://gitlab.example.internal/platform/ansible-collections/idm.git"
+    type: git
+    version: "v1.1.0"
+
+  - name: "platform.bootstrap"
+    source: "https://gitlab.example.internal/platform/ansible-collections/bootstrap.git"
+    type: git
+    version: "v1.0.2"
+
+  - name: "platform.hub_services"
+    source: "https://gitlab.example.internal/platform/ansible-collections/hub_services.git"
+    type: git
+    version: "v1.2.0"
+
+  - name: "platform.ztp"
+    source: "https://gitlab.example.internal/platform/ansible-collections/ztp.git"
+    type: git
+    version: "v1.0.1"
+
+  # ── Red Hat certified collections (from internal Automation Hub or Pulp) ──
+
+  - name: "community.vmware"
+    source: "https://automationhub.example.internal/api/galaxy/content/rh-certified/"
+    version: "4.3.0"
+
+  - name: "kubernetes.core"
+    source: "https://automationhub.example.internal/api/galaxy/content/rh-certified/"
+    version: "3.1.0"
+
+  - name: "redhat.rhel_system_roles"
+    source: "https://automationhub.example.internal/api/galaxy/content/rh-certified/"
+    version: "1.23.0"
+
+  - name: "ansible.posix"
+    source: "https://automationhub.example.internal/api/galaxy/content/rh-certified/"
+    version: "1.5.4"
+
+  - name: "community.general"
+    source: "https://automationhub.example.internal/api/galaxy/content/rh-certified/"
+    version: "8.6.0"
+
+  - name: "community.crypto"
+    source: "https://automationhub.example.internal/api/galaxy/content/rh-certified/"
+    version: "2.20.0"
+
+  - name: "ansible.utils"
+    source: "https://automationhub.example.internal/api/galaxy/content/rh-certified/"
+    version: "4.1.0"
+
+  - name: "redhat.openshift"
+    source: "https://automationhub.example.internal/api/galaxy/content/rh-certified/"
+    version: "3.1.0"
+
+  - name: "infra.ah_configuration"
+    source: "https://automationhub.example.internal/api/galaxy/content/rh-certified/"
+    version: "2.0.6"

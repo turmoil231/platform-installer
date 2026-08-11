@@ -1,0 +1,247 @@
+---
+##############################################################################
+# PLATFORM MANIFEST
+# Version: 2025.1.0
+#
+# This file is the single source of truth for every versioned artifact in
+# a platform deployment.  The installer cross-references this manifest at
+# every phase.  Changing a version here and re-running the installer is the
+# only supported way to upgrade any component.
+#
+# Rules:
+#   - All container images MUST be digest-pinned (sha256:...).
+#     Tag-only references are rejected by the installer.
+#   - All Helm charts MUST pin a specific semantic version.
+#   - All OCP/operator versions MUST match what is staged in assets.*
+#   - This file MUST be committed to git and treated as immutable for a
+#     given platform build.  Create a new version tag for every change.
+#
+# Digest pins: obtain with:
+#   skopeo inspect docker://registry.example.internal:5000/<image>:<tag> \
+#     | jq -r '.Digest'
+##############################################################################
+
+manifest_version: "2025.1.0"
+created: "2025-01-01T00:00:00Z"
+description: "Initial platform build — RHEL 9, OCP 4.16, ACM 2.11"
+
+
+##############################################################################
+# COMPONENT VERSIONS
+# Logical version references used in platform-config.yaml as version_ref keys.
+##############################################################################
+
+component_versions:
+  ocp_release:
+    version: "4.16.15"
+    arch: "x86_64"
+    release_image: "registry.example.internal:5000/ocp4/openshift4:4.16.15-x86_64"
+    release_image_digest: "sha256:<populate>"         # skopeo inspect output
+    rhcos_version: "416.94.202407011608-0"
+    rhcos_iso_sha256: "<populate>"
+    rhcos_rootfs_sha256: "<populate>"
+
+  acm:
+    version: "2.11.0"
+    channel: "release-2.11"
+    csv: "advanced-cluster-management.v2.11.0"
+
+  gitops:
+    version: "1.12.0"
+    channel: "latest"
+    csv: "openshift-gitops-operator.v1.12.0"
+
+  talm:
+    version: "4.16.0"
+    channel: "stable"
+    csv: "topology-aware-lifecycle-manager.v4.16.0"
+
+  odf:
+    version: "4.16.0"
+    channel: "stable-4.16"
+    csv: "odf-operator.v4.16.0"
+
+  lso:
+    version: "4.16.0"
+    channel: "stable"
+    csv: "local-storage-operator.v4.16.0"
+
+  cluster_logging:
+    version: "5.9.0"
+    channel: "stable"
+    csv: "cluster-logging.v5.9.0"
+
+  loki_operator:
+    version: "5.9.0"
+    channel: "stable"
+    csv: "loki-operator.v5.9.0"
+
+  metallb:
+    version: "4.16.0"
+    channel: "stable"
+    csv: "metallb-operator.v4.16.0"
+
+  kubevirt_hyperconverged:
+    version: "4.16.0"
+    channel: "stable"
+    csv: "kubevirt-hyperconverged-operator.v4.16.0"
+
+
+##############################################################################
+# GOLD IMAGES
+##############################################################################
+
+gold_images:
+  rhel9_base:
+    filename: "rhel-9-base-gold.qcow2"
+    os_version: "9.4"
+    sha256: "<populate>"
+    build_date: "2025-01-01"
+    notes: "RHEL 9.4 base, hardened per DISA STIG CAT I/II, cloud-init enabled"
+
+  rhel9_minimal:
+    filename: "rhel-9-minimal-gold.qcow2"
+    os_version: "9.4"
+    sha256: "<populate>"
+    build_date: "2025-01-01"
+    notes: "RHEL 9.4 minimal install, no GUI, no unnecessary services"
+
+  rhel9_ocp_node:
+    filename: "rhel-9-ocp-node-gold.qcow2"
+    os_version: "9.4"
+    sha256: "<populate>"
+    build_date: "2025-01-01"
+    notes: "RHEL 9.4 optimized for OCP VM nodes — cgroups v2, kernel tuning applied"
+
+
+##############################################################################
+# CONTAINER IMAGE PINS
+# All images must be pre-pulled and staged before deployment.
+# Installer pushes these to the mirror registry during phase 5.
+#
+# Format:
+#   <logical_name>:
+#     source: <original upstream registry path>:<tag>
+#     digest: sha256:<hash>
+#     mirror: <mirror registry path>:<tag>
+#     tar: <filename in assets.container_images.base_path>
+##############################################################################
+
+image_pins:
+  vault:
+    source: "docker.io/hashicorp/vault:1.16.3"
+    digest: "sha256:<populate>"
+    mirror: "registry.example.internal:5000/platform/vault:1.16.3"
+    tar: "vault-1.16.3.tar"
+
+  artifactory_oss:
+    source: "docker.io/releases-docker.jfrog.io/jfrog/artifactory-oss:7.84.14"
+    digest: "sha256:<populate>"
+    mirror: "registry.example.internal:5000/platform/artifactory-oss:7.84.14"
+    tar: "artifactory-oss-7.84.14.tar"
+
+  gitea:
+    source: "docker.io/gitea/gitea:1.21.11"
+    digest: "sha256:<populate>"
+    mirror: "registry.example.internal:5000/platform/gitea:1.21.11"
+    tar: "gitea-1.21.11.tar"
+
+  vault_agent_injector:
+    source: "docker.io/hashicorp/vault-k8s:1.4.2"
+    digest: "sha256:<populate>"
+    mirror: "registry.example.internal:5000/platform/vault-k8s:1.4.2"
+    tar: "vault-k8s-1.4.2.tar"
+
+  # Add all OCP release images, operator images, and OLM catalog images below.
+  # Tooling such as `oc adm release mirror` and `oc-mirror` should generate
+  # the bulk of this list from the OCP release payload.
+  # Example:
+  # ocp_installer:
+  #   source: "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:..."
+  #   digest: "sha256:<populate>"
+  #   mirror: "registry.example.internal:5000/ocp4/openshift4:4.16.15-x86_64-installer"
+  #   tar: "ocp4-installer-4.16.15.tar"
+
+
+##############################################################################
+# HELM CHART PINS
+# All charts must be pre-downloaded as .tgz and staged in assets.helm_charts.
+##############################################################################
+
+helm_charts:
+  vault:
+    repo: "https://helm.releases.hashicorp.com"
+    chart: "vault"
+    version: "0.28.1"
+    tar: "vault-0.28.1.tgz"
+    sha256: "<populate>"
+
+  artifactory_oss:
+    repo: "https://charts.jfrog.io"
+    chart: "artifactory-oss"
+    version: "107.84.14"
+    tar: "artifactory-oss-107.84.14.tgz"
+    sha256: "<populate>"
+
+  gitea:
+    repo: "https://dl.gitea.com/charts"
+    chart: "gitea"
+    version: "10.3.0"
+    tar: "gitea-10.3.0.tgz"
+    sha256: "<populate>"
+
+
+##############################################################################
+# RPM REPOSITORIES
+# Snapshots of Red Hat repos taken at build time.
+# Installer configures all nodes to use these via Artifactory.
+##############################################################################
+
+rpm_repos:
+  snapshot_date: "2025-01-01"
+  repos:
+    - id: "rhel-9-baseos"
+      name: "Red Hat Enterprise Linux 9 BaseOS"
+      baseurl: "https://artifactory.apps.hub.example.internal/artifactory/rpms-local/rhel-9-baseos"
+    - id: "rhel-9-appstream"
+      name: "Red Hat Enterprise Linux 9 AppStream"
+      baseurl: "https://artifactory.apps.hub.example.internal/artifactory/rpms-local/rhel-9-appstream"
+    - id: "rhel-9-ha"
+      name: "Red Hat Enterprise Linux 9 High Availability"
+      baseurl: "https://artifactory.apps.hub.example.internal/artifactory/rpms-local/rhel-9-ha"
+    - id: "rhocp-4.16"
+      name: "Red Hat OpenShift Container Platform 4.16"
+      baseurl: "https://artifactory.apps.hub.example.internal/artifactory/rpms-local/rhocp-4.16"
+
+
+##############################################################################
+# OLM CATALOG INDEX IMAGES
+##############################################################################
+
+olm_catalog_images:
+  redhat_operator_index:
+    source: "registry.redhat.io/redhat/redhat-operator-index:v4.16"
+    digest: "sha256:<populate>"
+    mirror: "registry.example.internal:5000/ocp4/redhat-operator-index:v4.16"
+    tar: "redhat-operator-index-v4.16.tar"
+
+  certified_operator_index:
+    source: "registry.redhat.io/redhat/certified-operator-index:v4.16"
+    digest: "sha256:<populate>"
+    mirror: "registry.example.internal:5000/ocp4/certified-operator-index:v4.16"
+    tar: "certified-operator-index-v4.16.tar"
+
+
+##############################################################################
+# CHANGELOG
+# Track changes between manifest versions.
+##############################################################################
+
+changelog:
+  - version: "2025.1.0"
+    date: "2025-01-01"
+    changes:
+      - "Initial platform build"
+      - "OCP 4.16.15, ACM 2.11.0, ODF 4.16.0"
+      - "Vault 1.16.3, Artifactory OSS 7.84.14, Gitea 1.21.11"
+      - "RHEL 9.4 gold images"

@@ -1,0 +1,175 @@
+# packaging/Containerfile
+#
+# Builds the platform-installer container image.
+# Everything needed to run a deployment is baked in:
+#   - Python venv with all dependencies (ansible-core, ansible-runner, click, pydantic, ...)
+#   - All Ansible collections (pre-installed from staged tarballs)
+#   - Thin orchestration playbooks
+#   - Vault HCL policies
+#
+# What is NOT baked in (mounted at runtime by the wrapper script):
+#   - platform-config.yaml + platform-manifest.yaml  (operator-specific)
+#   - SSH key pair                                    (operator-specific)
+#   - Internal CA cert + key                          (site-specific)
+#   - Pull secret                                     (site-specific)
+#   - Staged assets (gold images, ISOs, etc.)         (large; stays on host)
+#   - State directory                                 (must persist between runs)
+#
+# Build:
+#   ./packaging/build_image.sh
+#
+# The resulting image is saved as:
+#   dist/platform-installer-<VERSION>-container.tar.gz
+
+ARG RHEL_VERSION=9.4
+FROM registry.access.redhat.com/ubi9/ubi:${RHEL_VERSION}
+
+ARG VERSION=dev
+ARG BUILD_DATE
+ARG GIT_COMMIT
+
+LABEL name="platform-installer"                                    \
+      version="${VERSION}"                                          \
+      build-date="${BUILD_DATE}"                                    \
+      git-commit="${GIT_COMMIT}"                                    \
+      description="Disconnected platform deployment installer"     \
+      maintainer="platform-ops@example.internal"                   \
+      usage="See /opt/platform-installer/README.md"
+
+# ── System packages ───────────────────────────────────────────────────────────
+# Only what pip/ansible cannot provide itself.
+# openssh-clients  : ssh binary used by ansible for remote connections
+# git              : used by ansible-galaxy collection build internally
+# rsync            : used by some synchronization roles
+# jq               : useful in playbook shell tasks
+# krb5-workstation : Kerberos client (for IDM-joined host playbooks)
+RUN dnf install -y \
+      python3.11        \
+      python3.11-pip    \
+      openssh-clients   \
+      git               \
+      rsync             \
+      jq                \
+      krb5-workstation  \
+    && dnf clean all    \
+    && rm -rf /var/cache/dnf
+
+# ── Python virtualenv ─────────────────────────────────────────────────────────
+# Copy pre-seeded pip wheel cache from build context.
+# install with --no-index so no PyPI calls are made during image build.
+COPY packaging/pip-cache /tmp/pip-cache
+COPY . /src/platform-installer
+
+RUN python3.11 -m venv /opt/platform-installer-venv              \
+    && /opt/platform-installer-venv/bin/pip install               \
+         --quiet                                                   \
+         --no-index                                                \
+         --find-links /tmp/pip-cache                              \
+         /src/platform-installer                                   \
+    && /opt/platform-installer-venv/bin/pip freeze                \
+         > /opt/platform-installer-venv/python.lock.txt           \
+    && rm -rf /tmp/pip-cache /src/platform-installer
+
+# Verify key binaries were installed
+RUN for bin in ansible ansible-playbook ansible-galaxy ansible-runner platform-installer; do \
+      test -f "/opt/platform-installer-venv/bin/${bin}"           \
+        || (echo "ERROR: ${bin} missing from venv" && exit 1);    \
+    done
+
+# ── Ansible collections ───────────────────────────────────────────────────────
+# Collection tarballs are staged by build_image.sh before the build context
+# is handed to podman/docker.  They are installed here and the source tarballs
+# are removed — the installed collection tree is what the image ships.
+COPY ansible/collections/requirements.yml \
+     /opt/platform-installer/ansible/collections/requirements.yml
+COPY collections/                          /tmp/staged-collections/
+COPY collections.lock.yml                  /opt/platform-installer/collections.lock.yml
+
+RUN echo "Installing Ansible collections from staged tarballs ..." \
+    && find /tmp/staged-collections -name "*.tar.gz" | sort        \
+       | xargs -I{} /opt/platform-installer-venv/bin/ansible-galaxy \
+           collection install {}                                    \
+           --collections-path /opt/platform-installer/collections  \
+           --force                                                  \
+    && echo "Installed collections:"                               \
+    && /opt/platform-installer-venv/bin/ansible-galaxy             \
+           collection list                                         \
+           --collections-path /opt/platform-installer/collections  \
+    && rm -rf /tmp/staged-collections
+
+# ── Playbooks and supporting files ────────────────────────────────────────────
+COPY ansible/playbooks/  /opt/platform-installer/ansible/playbooks/
+COPY vault-policies/     /opt/platform-installer/vault-policies/
+
+# ── ansible.cfg (baked in, references the collection install path) ────────────
+RUN cat > /opt/platform-installer/ansible/ansible.cfg << 'CFG'
+[defaults]
+collections_paths     = /opt/platform-installer/collections
+host_key_checking     = False
+retry_files_enabled   = False
+stdout_callback       = yaml
+callbacks_enabled     = timer, profile_tasks
+timeout               = 30
+forks                 = 20
+gathering             = smart
+fact_caching          = jsonfile
+fact_caching_connection = /tmp/ansible_facts_cache
+fact_caching_timeout  = 7200
+
+[privilege_escalation]
+become        = True
+become_method = sudo
+become_user   = root
+
+[ssh_connection]
+ssh_args   = -o ControlMaster=auto -o ControlPersist=60s -o StrictHostKeyChecking=no
+pipelining = True
+retries    = 5
+
+[galaxy]
+server_list =
+# Empty — no Galaxy servers. All content is installed locally.
+CFG
+
+# ── Runtime environment ───────────────────────────────────────────────────────
+ENV PATH="/opt/platform-installer-venv/bin:${PATH}"               \
+    VIRTUAL_ENV="/opt/platform-installer-venv"                    \
+    ANSIBLE_COLLECTIONS_PATH="/opt/platform-installer/collections" \
+    ANSIBLE_CONFIG="/opt/platform-installer/ansible/ansible.cfg"  \
+    PLATFORM_ANSIBLE_DIR="/opt/platform-installer/ansible"        \
+    PLATFORM_VAULT_POLICIES="/opt/platform-installer/vault-policies" \
+    PLATFORM_COLLECTIONS_LOCK="/opt/platform-installer/collections.lock.yml" \
+    # Workspace is the mount point for all host-provided files
+    PLATFORM_WORKSPACE="/workspace"                               \
+    # State dir default — operator can override via -e STATE_DIR=
+    PLATFORM_STATE_DIR="/workspace/state"
+
+# ── Workspace mount point ─────────────────────────────────────────────────────
+# /workspace is where host-provided files are mounted at runtime.
+# Subdirectory layout (populated by wrapper script mounts):
+#   /workspace/config/          ← platform-config.yaml, platform-manifest.yaml
+#   /workspace/state/           ← installer state DB + ansible artifacts (persistent)
+#   /workspace/ssh/             ← SSH key pair (read-only)
+#   /workspace/pki/             ← Internal CA cert + key (read-only)
+#   /workspace/pull-secret.json ← Merged pull secret (read-only)
+#   /workspace/assets/          ← Staged assets root (read-only, large)
+RUN mkdir -p /workspace/config /workspace/state /workspace/ssh \
+             /workspace/pki /workspace/assets
+
+WORKDIR /workspace
+
+# ── Build metadata ────────────────────────────────────────────────────────────
+RUN echo "version=${VERSION}"       > /opt/platform-installer/BUILD.txt  \
+ && echo "build-date=${BUILD_DATE}" >> /opt/platform-installer/BUILD.txt  \
+ && echo "git-commit=${GIT_COMMIT}" >> /opt/platform-installer/BUILD.txt
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+# The entrypoint delegates to the platform-installer CLI.
+# The wrapper script on the host calls this image with the subcommand + args.
+# Example (from wrapper):
+#   podman run ... platform-installer:VERSION deploy --config /workspace/config/platform-config.yaml
+ENTRYPOINT ["platform-installer",                           \
+            "--collections-dir", "/opt/platform-installer/collections", \
+            "--collections-lock", "/opt/platform-installer/collections.lock.yml", \
+            "--skip-collection-install"]
+CMD ["--help"]

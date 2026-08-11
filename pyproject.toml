@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "platform-installer"
+version = "1.0.0"
+description = "Disconnected platform deployment installer"
+requires-python = ">=3.11"
+dependencies = [
+    "ansible-runner>=2.4",
+    "click>=8.1",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+    "hvac>=2.1",
+    "requests>=2.31",
+    "jinja2>=3.1",
+    "deepmerge>=1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "pytest-cov>=4.1",
+]
+
+[project.scripts]
+platform-installer = "installer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["installer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["installer"]
+omit = ["tests/*"]

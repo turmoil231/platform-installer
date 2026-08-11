@@ -1,0 +1,1701 @@
+---
+##############################################################################
+# PLATFORM DEPLOYMENT CONFIGURATION  —  v4.0.0
+# Disconnected / Air-Gapped  |  Bare-Metal-First
+#
+# Structure
+# ─────────────────────────────────────────────────────────────────────────────
+#   inventory:            Physical reality.  Servers, storage arrays, network.
+#                         No deployment intent.  Only facts about hardware.
+#
+#   platform_manifest:    Version pins for every artifact (see manifest file).
+#
+#   vmware:               Claims inventory servers → installs ESXi + vCenter.
+#                         Must be fully resolved before logical sections run.
+#
+#   management_services:  IDM (LDAP/DNS/CA), Kea (DHCP).  Deployed as VMs
+#                         on vSphere using claimed ESXi hosts.
+#
+#   hub_cluster:          OpenShift Hub.  vSphere IPI or Bare-Metal IPI/AI.
+#                         Claims either vsphere resources or inventory servers.
+#
+#   spoke_clusters:       Zero-to-many OCP spokes via ZTP/ACM.  Each spoke
+#                         independently chooses vsphere or baremetal.
+#
+#   hub_services:         All services deployed into the Hub cluster.
+#                         Each service is independently enable/disable with
+#                         its own configuration block.
+#
+#   vdi_services:         VDI stack.  vSphere pool today, OCP Virt tomorrow.
+#
+# Deployment phases
+# ─────────────────────────────────────────────────────────────────────────────
+#  0  preflight            Validate config+manifest, check BMC/storage reachability
+#  1  bootstrap            Deploy bootstrap VM → start Vault + Artifactory containers
+#  2  vmware               Install ESXi on claimed servers → deploy vCenter → configure
+#                          clusters, dvSwitches, datastores, vVols
+#  3  management_services  Deploy IDM VMs, configure DNS/LDAP/CA; deploy Kea DHCP
+#  4  registry             Deploy mirror registry VM; push all staged images + OLM catalogs
+#  5  hub_cluster          Deploy OpenShift Hub (vSphere IPI or Bare-Metal AI/IPI)
+#                          Install Pure CSI driver immediately post-install
+#  6  hub_services         Install operators + deploy all enabled hub services
+#                          Migrate Vault + Artifactory from bootstrap → hub
+#                          Deploy GitLab; wire ArgoCD to GitLab
+#  7  acm                  Configure ACM MultiClusterHub + Assisted Service + InfraEnv
+#  8  spoke_clusters       ZTP spoke deployments (0 to N, order defined below)
+#  9  vdi_services         Deploy VDI pool (vSphere or OCP Virt)
+# 10  validation           End-to-end health checks; emit deployment report
+# 11  bootstrap_teardown   (manual/optional) Decommission bootstrap VM
+##############################################################################
+
+
+##############################################################################
+# PLATFORM MANIFEST REFERENCE
+##############################################################################
+
+platform_manifest:
+  file: "platform-manifest.yaml"
+  version: "2025.1.0"
+  # Manifest pins: OCP release digest, every operator CSV, every container
+  # image digest, every Helm chart version, gold image checksums, RPM snapshot IDs.
+  # Installer aborts if loaded manifest version != this value.
+
+
+##############################################################################
+# GLOBAL
+##############################################################################
+
+global:
+  environment_name: "platform-prod-01"
+  domain_base: "example.internal"
+  timezone: "America/Denver"
+  disconnected_mode: true                    # Enforced — no outbound connections attempted
+
+  ntp_servers:
+    - "ntp1.example.internal"
+    - "ntp2.example.internal"
+
+  tls:
+    internal_ca_cert_path: "/etc/pki/ca-trust/source/anchors/internal-ca.crt"
+    internal_ca_key_path:  "/etc/pki/private/internal-ca.key"
+
+  ssh:
+    public_key_path:  "/root/.ssh/platform-installer.pub"
+    private_key_path: "/root/.ssh/platform-installer"
+
+  pull_secret_path: "/root/pull-secret.json"
+
+  automation:
+    fully_automated: true
+    approval_checkpoints:           # Only honored when fully_automated: false
+      - post_vmware
+      - post_hub_cluster
+      - pre_spoke_clusters
+      - pre_bootstrap_teardown
+    retry_on_failure: true
+    max_retries: 3
+    retry_delay_seconds: 60
+    log_level: "info"               # debug | info | warn | error
+
+
+##############################################################################
+# STAGED ASSETS
+# Everything must be pre-staged on the admin server before phase 0.
+##############################################################################
+
+assets:
+  staging_root: "/mnt/platform-assets"
+  gold_images:
+    base_path: "gold-images"
+    # Filenames + SHA-256 checksums live in platform-manifest.yaml
+    images:
+      rhel9_base:     { filename: "rhel-9-base-gold.qcow2"     }
+      rhel9_minimal:  { filename: "rhel-9-minimal-gold.qcow2"  }
+      rhel9_ocp_node: { filename: "rhel-9-ocp-node-gold.qcow2" }
+      esxi:           { filename: "VMware-ESXi-8.0U3.iso"      }
+  isos:
+    base_path: "isos"
+    rhcos_live_iso: "rhcos-live.x86_64.iso"
+    rhcos_rootfs:   "rhcos-live-rootfs.x86_64.img"
+  rpms:
+    base_path: "rpms"
+  container_images:
+    base_path: "container-images"   # Image list sourced from manifest image_pins
+  helm_charts:
+    base_path: "helm-charts"
+  olm_catalogs:
+    base_path: "olm-catalogs"
+    catalogs:
+      - { name: "redhat-operator-index",    image_tar: "redhat-operator-index.tar"    }
+      - { name: "certified-operator-index", image_tar: "certified-operator-index.tar" }
+  git_bundles:
+    base_path: "git-bundles"
+    platform_manifests_bundle: "platform-manifests.bundle"
+    ztp_config_bundle:         "ztp-config.bundle"
+
+
+##############################################################################
+##############################################################################
+##                                                                          ##
+##                         I N V E N T O R Y                               ##
+##                                                                          ##
+##   Physical reality only.  No deployment intent.                         ##
+##   Servers, storage arrays, and network topology.                        ##
+##   Logical sections below reference these entries by name.               ##
+##                                                                          ##
+##############################################################################
+##############################################################################
+
+inventory:
+
+  ############################################################################
+  # COMPUTE
+  # Each server entry describes the physical hardware.
+  # The installer uses BMC credentials to power-cycle, mount ISOs, and PXE.
+  #
+  # role_hint is informational only — it does not deploy anything.
+  # Actual role assignment happens in vmware.hosts, hub_cluster.nodes,
+  # spoke_clusters[*].nodes, etc.
+  #
+  # nic_bonds / nic_profiles describe physical NIC layout so the installer
+  # knows which MACs to use for which network segment when building
+  # kickstart/ignition configs or ESXi host profiles.
+  ############################################################################
+
+  compute:
+
+    # ── vSphere Infrastructure Hosts ────────────────────────────────────────
+    esxi-host-01:
+      role_hint: "esxi"
+      make: "Dell"
+      model: "PowerEdge R750"
+      bmc:
+        protocol: "redfish"                  # redfish | ipmi
+        address: "192.168.1.11"
+        port: 443
+        credentials_secret: "vault:secret/bmc/esxi-host-01"
+        disable_certificate_verification: true
+      nics:
+        - { name: "eno1", mac: "AA:BB:CC:00:01:01", speed_gbps: 25, purpose: "management" }
+        - { name: "eno2", mac: "AA:BB:CC:00:01:02", speed_gbps: 25, purpose: "management" }
+        - { name: "ens1f0", mac: "AA:BB:CC:00:01:03", speed_gbps: 25, purpose: "vmotion + storage" }
+        - { name: "ens1f1", mac: "AA:BB:CC:00:01:04", speed_gbps: 25, purpose: "vmotion + storage" }
+        - { name: "ens2f0", mac: "AA:BB:CC:00:01:05", speed_gbps: 100, purpose: "vm_traffic" }
+        - { name: "ens2f1", mac: "AA:BB:CC:00:01:06", speed_gbps: 100, purpose: "vm_traffic" }
+      disks:
+        - { slot: 0, size_gb: 480,  type: "ssd", purpose: "esxi_boot"  }
+        - { slot: 1, size_gb: 480,  type: "ssd", purpose: "esxi_boot"  }  # mirror
+      memory_gb: 512
+      cpu_sockets: 2
+      cpu_cores_per_socket: 32
+
+    esxi-host-02:
+      role_hint: "esxi"
+      make: "Dell"
+      model: "PowerEdge R750"
+      bmc:
+        protocol: "redfish"
+        address: "192.168.1.12"
+        port: 443
+        credentials_secret: "vault:secret/bmc/esxi-host-02"
+        disable_certificate_verification: true
+      nics:
+        - { name: "eno1", mac: "AA:BB:CC:00:02:01", speed_gbps: 25, purpose: "management" }
+        - { name: "eno2", mac: "AA:BB:CC:00:02:02", speed_gbps: 25, purpose: "management" }
+        - { name: "ens1f0", mac: "AA:BB:CC:00:02:03", speed_gbps: 25, purpose: "vmotion + storage" }
+        - { name: "ens1f1", mac: "AA:BB:CC:00:02:04", speed_gbps: 25, purpose: "vmotion + storage" }
+        - { name: "ens2f0", mac: "AA:BB:CC:00:02:05", speed_gbps: 100, purpose: "vm_traffic" }
+        - { name: "ens2f1", mac: "AA:BB:CC:00:02:06", speed_gbps: 100, purpose: "vm_traffic" }
+      disks:
+        - { slot: 0, size_gb: 480, type: "ssd", purpose: "esxi_boot" }
+        - { slot: 1, size_gb: 480, type: "ssd", purpose: "esxi_boot" }
+      memory_gb: 512
+      cpu_sockets: 2
+      cpu_cores_per_socket: 32
+
+    esxi-host-03:
+      role_hint: "esxi"
+      make: "Dell"
+      model: "PowerEdge R750"
+      bmc:
+        protocol: "redfish"
+        address: "192.168.1.13"
+        port: 443
+        credentials_secret: "vault:secret/bmc/esxi-host-03"
+        disable_certificate_verification: true
+      nics:
+        - { name: "eno1", mac: "AA:BB:CC:00:03:01", speed_gbps: 25, purpose: "management" }
+        - { name: "eno2", mac: "AA:BB:CC:00:03:02", speed_gbps: 25, purpose: "management" }
+        - { name: "ens1f0", mac: "AA:BB:CC:00:03:03", speed_gbps: 25, purpose: "vmotion + storage" }
+        - { name: "ens1f1", mac: "AA:BB:CC:00:03:04", speed_gbps: 25, purpose: "vmotion + storage" }
+        - { name: "ens2f0", mac: "AA:BB:CC:00:03:05", speed_gbps: 100, purpose: "vm_traffic" }
+        - { name: "ens2f1", mac: "AA:BB:CC:00:03:06", speed_gbps: 100, purpose: "vm_traffic" }
+      disks:
+        - { slot: 0, size_gb: 480, type: "ssd", purpose: "esxi_boot" }
+        - { slot: 1, size_gb: 480, type: "ssd", purpose: "esxi_boot" }
+      memory_gb: 512
+      cpu_sockets: 2
+      cpu_cores_per_socket: 32
+
+    # ── OpenShift Hub Nodes (bare-metal option) ──────────────────────────────
+    # These entries are also used by vmware IPI if hub_cluster.platform = vsphere;
+    # in that case the installer deploys VMs on the ESXi hosts above instead
+    # and these BMC entries are not used for OCP node provisioning.
+    hub-node-01:
+      role_hint: "ocp_hub_master"
+      make: "Dell"
+      model: "PowerEdge R650"
+      bmc:
+        protocol: "redfish"
+        address: "192.168.1.21"
+        port: 443
+        credentials_secret: "vault:secret/bmc/hub-node-01"
+        disable_certificate_verification: true
+      nics:
+        - { name: "eno1", mac: "AA:BB:CC:00:11:01", speed_gbps: 25, purpose: "provisioning + mgmt" }
+        - { name: "ens1f0", mac: "AA:BB:CC:00:11:02", speed_gbps: 25, purpose: "ocp_cluster" }
+        - { name: "ens1f1", mac: "AA:BB:CC:00:11:03", speed_gbps: 25, purpose: "storage" }
+      disks:
+        - { slot: 0, size_gb: 960,  type: "nvme", purpose: "os"      }
+        - { slot: 1, size_gb: 3840, type: "nvme", purpose: "odf_data" }
+        - { slot: 2, size_gb: 3840, type: "nvme", purpose: "odf_data" }
+      memory_gb: 256
+      cpu_sockets: 2
+      cpu_cores_per_socket: 24
+
+    hub-node-02:
+      role_hint: "ocp_hub_master"
+      make: "Dell"
+      model: "PowerEdge R650"
+      bmc:
+        protocol: "redfish"
+        address: "192.168.1.22"
+        port: 443
+        credentials_secret: "vault:secret/bmc/hub-node-02"
+        disable_certificate_verification: true
+      nics:
+        - { name: "eno1", mac: "AA:BB:CC:00:12:01", speed_gbps: 25, purpose: "provisioning + mgmt" }
+        - { name: "ens1f0", mac: "AA:BB:CC:00:12:02", speed_gbps: 25, purpose: "ocp_cluster" }
+        - { name: "ens1f1", mac: "AA:BB:CC:00:12:03", speed_gbps: 25, purpose: "storage" }
+      disks:
+        - { slot: 0, size_gb: 960,  type: "nvme", purpose: "os"      }
+        - { slot: 1, size_gb: 3840, type: "nvme", purpose: "odf_data" }
+        - { slot: 2, size_gb: 3840, type: "nvme", purpose: "odf_data" }
+      memory_gb: 256
+      cpu_sockets: 2
+      cpu_cores_per_socket: 24
+
+    hub-node-03:
+      role_hint: "ocp_hub_master"
+      make: "Dell"
+      model: "PowerEdge R650"
+      bmc:
+        protocol: "redfish"
+        address: "192.168.1.23"
+        port: 443
+        credentials_secret: "vault:secret/bmc/hub-node-03"
+        disable_certificate_verification: true
+      nics:
+        - { name: "eno1", mac: "AA:BB:CC:00:13:01", speed_gbps: 25, purpose: "provisioning + mgmt" }
+        - { name: "ens1f0", mac: "AA:BB:CC:00:13:02", speed_gbps: 25, purpose: "ocp_cluster" }
+        - { name: "ens1f1", mac: "AA:BB:CC:00:13:03", speed_gbps: 25, purpose: "storage" }
+      disks:
+        - { slot: 0, size_gb: 960,  type: "nvme", purpose: "os"      }
+        - { slot: 1, size_gb: 3840, type: "nvme", purpose: "odf_data" }
+        - { slot: 2, size_gb: 3840, type: "nvme", purpose: "odf_data" }
+      memory_gb: 256
+      cpu_sockets: 2
+      cpu_cores_per_socket: 24
+
+    # ── Spoke Node Pool ──────────────────────────────────────────────────────
+    # Servers available for spoke cluster assignment.
+    # Each spoke's node list references servers by name from this pool.
+    spoke-node-01:
+      role_hint: "ocp_spoke"
+      make: "Dell"
+      model: "PowerEdge R450"
+      bmc:
+        protocol: "redfish"
+        address: "192.168.1.31"
+        port: 443
+        credentials_secret: "vault:secret/bmc/spoke-node-01"
+        disable_certificate_verification: true
+      nics:
+        - { name: "eno1", mac: "AA:BB:CC:00:21:01", speed_gbps: 25, purpose: "provisioning + mgmt" }
+        - { name: "ens1f0", mac: "AA:BB:CC:00:21:02", speed_gbps: 25, purpose: "ocp_cluster" }
+        - { name: "ens1f1", mac: "AA:BB:CC:00:21:03", speed_gbps: 25, purpose: "storage" }
+      disks:
+        - { slot: 0, size_gb: 960,  type: "nvme", purpose: "os"       }
+        - { slot: 1, size_gb: 1920, type: "nvme", purpose: "odf_data"  }
+      memory_gb: 128
+      cpu_sockets: 1
+      cpu_cores_per_socket: 32
+
+    spoke-node-02:
+      role_hint: "ocp_spoke"
+      make: "Dell"
+      model: "PowerEdge R450"
+      bmc:
+        protocol: "redfish"
+        address: "192.168.1.32"
+        port: 443
+        credentials_secret: "vault:secret/bmc/spoke-node-02"
+        disable_certificate_verification: true
+      nics:
+        - { name: "eno1", mac: "AA:BB:CC:00:22:01", speed_gbps: 25, purpose: "provisioning + mgmt" }
+        - { name: "ens1f0", mac: "AA:BB:CC:00:22:02", speed_gbps: 25, purpose: "ocp_cluster" }
+        - { name: "ens1f1", mac: "AA:BB:CC:00:22:03", speed_gbps: 25, purpose: "storage" }
+      disks:
+        - { slot: 0, size_gb: 960,  type: "nvme", purpose: "os"      }
+        - { slot: 1, size_gb: 1920, type: "nvme", purpose: "odf_data" }
+      memory_gb: 128
+      cpu_sockets: 1
+      cpu_cores_per_socket: 32
+
+    spoke-node-03:
+      role_hint: "ocp_spoke"
+      make: "Dell"
+      model: "PowerEdge R450"
+      bmc:
+        protocol: "redfish"
+        address: "192.168.1.33"
+        port: 443
+        credentials_secret: "vault:secret/bmc/spoke-node-03"
+        disable_certificate_verification: true
+      nics:
+        - { name: "eno1", mac: "AA:BB:CC:00:23:01", speed_gbps: 25, purpose: "provisioning + mgmt" }
+        - { name: "ens1f0", mac: "AA:BB:CC:00:23:02", speed_gbps: 25, purpose: "ocp_cluster" }
+        - { name: "ens1f1", mac: "AA:BB:CC:00:23:03", speed_gbps: 25, purpose: "storage" }
+      disks:
+        - { slot: 0, size_gb: 960,  type: "nvme", purpose: "os"      }
+        - { slot: 1, size_gb: 1920, type: "nvme", purpose: "odf_data" }
+      memory_gb: 128
+      cpu_sockets: 1
+      cpu_cores_per_socket: 32
+
+  ############################################################################
+  # STORAGE ARRAYS
+  # Physical storage hardware facts.  Protocol config, management endpoints,
+  # credentials.  Logical use (datastores, CSI, S3 buckets) is defined in
+  # the storage: section of each logical block.
+  ############################################################################
+
+  storage:
+
+    pure_flash_arrays:
+      - name: "flasharray-01"
+        model: "Pure Storage FlashArray//XL"
+        management:
+          hostname: "flasharray-01-mgmt.mgmt.example.internal"
+          ip: "10.0.10.40"
+          port: 443
+          credentials_secret: "vault:secret/storage/flasharray-01"
+        iscsi:
+          enabled: true
+          target_iqn_prefix: "iqn.2024-01.com.purestorage"
+          data_interfaces:
+            - { name: "ct0.eth2", ip: "10.0.60.10", speed_gbps: 25 }
+            - { name: "ct0.eth3", ip: "10.0.60.11", speed_gbps: 25 }
+            - { name: "ct1.eth2", ip: "10.0.60.12", speed_gbps: 25 }
+            - { name: "ct1.eth3", ip: "10.0.60.13", speed_gbps: 25 }
+        nvme_tcp:
+          enabled: false
+          data_interfaces: []
+        fibre_channel:
+          enabled: false
+          wwpns: []
+        vvols:
+          enabled: false
+          vasa_provider_url: ""
+        replication:
+          enabled: false
+
+    pure_flash_blades:
+      - name: "flashblade-01"
+        model: "Pure Storage FlashBlade//S"
+        management:
+          hostname: "flashblade-01-mgmt.mgmt.example.internal"
+          ip: "10.0.10.41"
+          port: 443
+          credentials_secret: "vault:secret/storage/flashblade-01"
+        nfs:
+          enabled: true
+          nfs_version: "4.1"
+          data_vips:
+            - { name: "vip0", ip: "10.0.60.20", speed_gbps: 25 }
+            - { name: "vip1", ip: "10.0.60.21", speed_gbps: 25 }
+        s3:
+          enabled: true
+          endpoint_hostname: "flashblade-01-s3.mgmt.example.internal"
+          data_vips:
+            - { name: "s3-vip0", ip: "10.0.60.22", speed_gbps: 25 }
+            - { name: "s3-vip1", ip: "10.0.60.23", speed_gbps: 25 }
+          virtual_hosted_style: false
+          tls: true
+
+  ############################################################################
+  # NETWORK TOPOLOGY
+  # L2/L3 facts.  VLAN IDs, CIDRs, gateways.  No deployment intent here —
+  # logical sections reference segments by name.
+  ############################################################################
+
+  network:
+    segments:
+      oob_mgmt:
+        cidr: "192.168.1.0/24"
+        vlan_id: 1
+        gateway: "192.168.1.1"
+        purpose: "Out-of-band BMC / iDRAC management — admin server access only"
+
+      management:
+        cidr: "10.0.10.0/24"
+        vlan_id: 10
+        gateway: "10.0.10.1"
+        dns_zone: "mgmt.example.internal"
+        purpose: "Bootstrap VM, IDM, Kea, mirror registry, vCenter"
+
+      ocp_hub:
+        cidr: "10.0.20.0/24"
+        vlan_id: 20
+        gateway: "10.0.20.1"
+        dns_zone: "hub.example.internal"
+        purpose: "OpenShift Hub cluster node networking"
+
+      ocp_spoke_base:
+        # Spokes get sequential /24s allocated from this block at deploy time.
+        # spoke-01 → 10.0.30.0/24 VLAN 30, spoke-02 → 10.0.31.0/24 VLAN 31 …
+        base_cidr: "10.0.30.0/16"
+        vlan_base_id: 30
+        gateway_last_octet: 1
+        dns_zone_pattern: "spoke-{idx:02d}.example.internal"
+
+      provisioning:
+        cidr: "172.22.0.0/24"
+        vlan_id: 99
+        gateway: ""
+        purpose: "Isolated L2 — bare-metal PXE + Redfish provisioning only"
+
+      storage:
+        cidr: "10.0.60.0/24"
+        vlan_id: 60
+        gateway: "10.0.60.1"
+        purpose: "Pure FlashArray iSCSI/NVMe-TCP + FlashBlade NFS/S3 data"
+
+      vdi:
+        cidr: "10.0.50.0/24"
+        vlan_id: 50
+        gateway: "10.0.50.1"
+        dns_zone: "vdi.example.internal"
+        purpose: "VDI workload networking"
+
+      vmotion:
+        cidr: "10.0.70.0/24"
+        vlan_id: 70
+        gateway: ""
+        purpose: "VMware vMotion (ESXi hosts only)"
+
+    default_mtu: 9000
+    jumbo_mtu_segments: ["storage", "vmotion"]
+    static_routes: []
+
+    # Physical switch uplinks — informational; used by installer to validate
+    # dvSwitch NIC teaming policy against actual topology.
+    uplinks:
+      - name: "uplink-1"
+        description: "Active uplink — odd-numbered NICs → ToR switch A"
+      - name: "uplink-2"
+        description: "Standby uplink — even-numbered NICs → ToR switch B"
+
+
+##############################################################################
+##############################################################################
+##                                                                          ##
+##                L O G I C A L   A R C H I T E C T U R E                 ##
+##                                                                          ##
+##   Everything below references inventory entries by name.               ##
+##   This is where deployment intent lives.                                ##
+##                                                                          ##
+##############################################################################
+##############################################################################
+
+
+##############################################################################
+# VMWARE
+# Claims inventory compute servers → installs ESXi → deploys vCenter.
+# Must complete before any logical section that uses platform: vsphere.
+##############################################################################
+
+vmware:
+  enabled: true
+
+  esxi:
+    version_ref: "esxi"                      # Resolves to ISO in assets.gold_images
+    # Servers to install ESXi on — must exist in inventory.compute
+    hosts:
+      - server: "esxi-host-01"
+        hostname: "esxi-01.mgmt.example.internal"
+        management_ip: "10.0.10.51"
+        management_nic: "eno1"              # NIC name from inventory entry
+        vmotion_ip: "10.0.70.51"
+        storage_ips:
+          - { nic: "ens1f0", ip: "10.0.60.51" }
+          - { nic: "ens1f1", ip: "10.0.60.52" }
+        root_password_secret: "vault:secret/esxi/esxi-host-01-root"
+
+      - server: "esxi-host-02"
+        hostname: "esxi-02.mgmt.example.internal"
+        management_ip: "10.0.10.52"
+        management_nic: "eno1"
+        vmotion_ip: "10.0.70.52"
+        storage_ips:
+          - { nic: "ens1f0", ip: "10.0.60.53" }
+          - { nic: "ens1f1", ip: "10.0.60.54" }
+        root_password_secret: "vault:secret/esxi/esxi-host-02-root"
+
+      - server: "esxi-host-03"
+        hostname: "esxi-03.mgmt.example.internal"
+        management_ip: "10.0.10.53"
+        management_nic: "eno1"
+        vmotion_ip: "10.0.70.53"
+        storage_ips:
+          - { nic: "ens1f0", ip: "10.0.60.55" }
+          - { nic: "ens1f1", ip: "10.0.60.56" }
+        root_password_secret: "vault:secret/esxi/esxi-host-03-root"
+
+    # ESXi host profile applied to all hosts after install
+    host_profile:
+      ntp_servers: "{{global.ntp_servers}}"
+      syslog_host: "udp://10.0.10.11:514"
+      advanced_settings:
+        "Net.TcpipHeapSize": 32
+        "Net.TcpipHeapMax": 1536
+        "VSAN.SwapThickProvisionDisabled": 1
+
+    # dvSwitch layout applied to all hosts
+    dvswitch:
+      name: "dvSwitch-Platform"
+      version: "8.0.0"
+      uplinks: ["uplink-1", "uplink-2"]
+      mtu: 9000
+      port_groups:
+        - { name: "PG-Management",   vlan_id: 10,  teaming: "active-active" }
+        - { name: "PG-OCP-Hub",      vlan_id: 20,  teaming: "active-active" }
+        - { name: "PG-Provisioning", vlan_id: 99,  teaming: "active-active" }
+        - { name: "PG-Storage",      vlan_id: 60,  teaming: "active-active" }
+        - { name: "PG-vMotion",      vlan_id: 70,  teaming: "active-standby" }
+        - { name: "PG-VDI",          vlan_id: 50,  teaming: "active-active" }
+        # Spoke port groups added dynamically per spoke during spoke_clusters phase
+        - { name: "PG-OCP-Spoke-Trunk", vlan_id: "30-45", trunk: true, teaming: "active-active" }
+
+    # iSCSI initiator configuration on ESXi hosts
+    iscsi:
+      enabled: true
+      # Array target references — points to inventory.storage entries
+      targets:
+        - array: "flasharray-01"
+      vmk_adapters:
+        - vmk: "vmk2"
+          ip_suffix: "same_as_storage_ips"   # Installer assigns from host storage_ips
+          vswitch: "dvSwitch-Platform"
+          portgroup: "PG-Storage"
+          mtu: 9000
+        - vmk: "vmk3"
+          ip_suffix: "same_as_storage_ips"
+          vswitch: "dvSwitch-Platform"
+          portgroup: "PG-Storage"
+          mtu: 9000
+
+  vcenter:
+    hostname: "vcenter.mgmt.example.internal"
+    ip: "10.0.10.50"
+    # vCenter VCSA deployed as an OVA onto the first ESXi host during bootstrap,
+    # then joined to the full cluster once all ESXi hosts are installed.
+    bootstrap_host: "esxi-host-01"
+    vcsa_ova_path: "generic-local/VMware-vCenter-Server-Appliance.ova" # Artifactory path
+    credentials_secret: "vault:secret/vmware/vcenter-creds"
+    thumbprint: ""                           # Populated by installer after VCSA deploy
+    sso:
+      domain: "vsphere.local"
+      password_secret: "vault:secret/vmware/vcenter-sso"
+    datacenter: "DC-Primary"
+    cluster: "Compute-Cluster-01"
+    ha:
+      enabled: true
+      admission_control: "percentage"
+      failover_percentage: 25
+    drs:
+      enabled: true
+      automation_level: "fullyAutomated"
+    # Datastores presented from Pure FlashArray via iSCSI
+    datastores:
+      - name: "pure-vmfs-mgmt"
+        type: "vmfs"
+        array: "flasharray-01"
+        protocol: "iscsi"
+        size_tb: 20
+        purpose: "Management VMs, bootstrap, vCenter"
+      - name: "pure-vmfs-ocp-hub"
+        type: "vmfs"
+        array: "flasharray-01"
+        protocol: "iscsi"
+        size_tb: 40
+        purpose: "OCP Hub VM nodes (when hub is vSphere-based)"
+      - name: "pure-vmfs-vdi"
+        type: "vmfs"
+        array: "flasharray-01"
+        protocol: "iscsi"
+        size_tb: 50
+        purpose: "VDI VM storage"
+      - name: "pure-nfs-shared"
+        type: "nfs"
+        blade: "flashblade-01"
+        nfs_export: "/platform-shared"
+        nfs_version: "4.1"
+        purpose: "Shared NFS — VDI linked-clone base images, ISO library"
+    vm_folder_structure:
+      - "Platform/Bootstrap"
+      - "Platform/Management"
+      - "Platform/Hub"
+      - "Platform/VDI"
+
+
+##############################################################################
+# BOOTSTRAP
+# First VM deployed (on vSphere, before full cluster).
+# Runs Vault + Artifactory as rootless Podman containers.
+# Installer engine for all phases until hub services are validated.
+# Decommissioned in phase 11.
+##############################################################################
+
+bootstrap:
+  vm:
+    hostname: "bootstrap"
+    fqdn: "bootstrap.mgmt.example.internal"
+    ip: "10.0.10.5"
+    gold_image: "rhel9_base"
+    vsphere:
+      host: "esxi-host-01"                   # Deployed directly to ESXi before vCenter ready
+      datastore: "pure-vmfs-mgmt"
+      network: "PG-Management"
+      folder: "Platform/Bootstrap"
+    resources:
+      cpu: 8
+      memory_gb: 32
+      disks:
+        - { size_gb: 100,  label: "os",   datastore: "pure-vmfs-mgmt" }
+        - { size_gb: 1000, label: "data", datastore: "pure-vmfs-mgmt" }
+
+  vault:
+    image_ref: "registry.example.internal:5000/platform/vault"  # Tag from manifest
+    data_dir:   "/opt/bootstrap/vault/data"
+    port: 8200
+    tls:
+      cert_path: "/opt/bootstrap/vault/tls/vault.crt"
+      key_path:  "/opt/bootstrap/vault/tls/vault.key"
+    init:
+      key_shares: 5
+      key_threshold: 3
+      output_path: "/root/vault-init-keys.json.enc"  # GPG-encrypted
+      gpg_key_id: ""                         # Operator GPG key fingerprint
+    auth:
+      method: "approle"
+      role_id_env:   "VAULT_ROLE_ID"
+      secret_id_env: "VAULT_SECRET_ID"
+    secret_mounts:
+      - { path: "secret", type: "kv-v2" }
+      - { path: "pki",    type: "pki"   }
+
+  artifactory:
+    image_ref: "registry.example.internal:5000/platform/artifactory-oss"
+    data_dir:    "/opt/bootstrap/artifactory/data"
+    port: 8081
+    port_router: 8082
+    tls:
+      cert_path: "/opt/bootstrap/artifactory/tls/artifactory.crt"
+      key_path:  "/opt/bootstrap/artifactory/tls/artifactory.key"
+    admin_password_secret: "vault:secret/bootstrap/artifactory-admin"
+    repositories:
+      - { name: "rpms-local",    type: "local", package_type: "rpm"     }
+      - { name: "helm-local",    type: "local", package_type: "helm"    }
+      - { name: "generic-local", type: "local", package_type: "generic" }
+    seed_from_staging: true
+
+  teardown:
+    enabled: true
+    prerequisites:
+      - hub_vault_healthy
+      - hub_artifactory_healthy
+      - gitlab_healthy
+      - acm_hub_ready
+    delete_vm: true
+    delete_dns_records: true
+    delete_dhcp_reservations: true
+
+
+##############################################################################
+# MIRROR REGISTRY
+# VM on vSphere.  Receives all staged images from admin server.
+# Serves as the only container image source for the entire environment.
+##############################################################################
+
+mirror_registry:
+  vm:
+    hostname: "registry"
+    fqdn: "registry.example.internal"
+    ip: "10.0.10.11"
+    gold_image: "rhel9_base"
+    vsphere:
+      datastore: "pure-vmfs-mgmt"
+      network: "PG-Management"
+      folder: "Platform/Management"
+    resources:
+      cpu: 4
+      memory_gb: 16
+      disks:
+        - { size_gb: 100,  label: "os",            datastore: "pure-vmfs-mgmt" }
+        - { size_gb: 2000, label: "registry_data",  datastore: "pure-vmfs-mgmt" }
+  registry:
+    port: 5000
+    http_port: 8080                          # RHCOS ISO/rootfs served over plain HTTP
+    tls:
+      cert_secret: "vault:secret/certs/registry"
+    namespaces:
+      ocp_release: "ocp4/openshift4"
+      operators:   "ocp4/operators"
+      olm_index:   "ocp4/redhat-operator-index"
+      platform:    "platform"
+    image_content_sources:
+      - mirrors: ["registry.example.internal:5000/ocp4/openshift4"]
+        source: "quay.io/openshift-release-dev/ocp-release"
+      - mirrors: ["registry.example.internal:5000/ocp4/openshift4"]
+        source: "quay.io/openshift-release-dev/ocp-v4.0-art-dev"
+      - mirrors: ["registry.example.internal:5000/ocp4/operators"]
+        source: "registry.redhat.io/redhat"
+      - mirrors: ["registry.example.internal:5000/platform"]
+        source: "registry.connect.redhat.com"
+
+
+##############################################################################
+# MANAGEMENT SERVICES
+# IDM (DNS + LDAP + Kerberos + CA) and Kea DHCP.
+# Deployed as VMs on vSphere using the management datastore.
+##############################################################################
+
+management_services:
+
+  idm:
+    vms:
+      primary:
+        hostname: "idm-01"
+        fqdn: "idm-01.mgmt.example.internal"
+        ip: "10.0.10.20"
+        gold_image: "rhel9_base"
+        vsphere:
+          datastore: "pure-vmfs-mgmt"
+          network: "PG-Management"
+          folder: "Platform/Management"
+        resources:
+          cpu: 4
+          memory_gb: 16
+          disks:
+            - { size_gb: 100, label: "os", datastore: "pure-vmfs-mgmt" }
+      replica:
+        hostname: "idm-02"
+        fqdn: "idm-02.mgmt.example.internal"
+        ip: "10.0.10.21"
+        gold_image: "rhel9_base"
+        vsphere:
+          datastore: "pure-vmfs-mgmt"
+          network: "PG-Management"
+          folder: "Platform/Management"
+        resources:
+          cpu: 4
+          memory_gb: 16
+          disks:
+            - { size_gb: 100, label: "os", datastore: "pure-vmfs-mgmt" }
+
+    config:
+      realm: "EXAMPLE.INTERNAL"
+      domain: "example.internal"
+      admin_password_secret: "vault:secret/idm/admin-password"
+      ds_password_secret:    "vault:secret/idm/ds-password"
+      setup_dns: true
+      ca_subject: "CN=Platform Internal CA,O=Example,C=US"
+      forwarders: []                         # No external forwarders — disconnected
+      reverse_zones:
+        - "10.0.10.0/24"
+        - "10.0.20.0/24"
+        - "10.0.30.0/16"
+        - "10.0.50.0/24"
+        - "10.0.60.0/24"
+        - "10.0.70.0/24"
+        - "192.168.1.0/24"
+
+    ldap:
+      base_dn: "dc=example,dc=internal"
+      bind_user: "uid=svc-ocp-ldap,cn=sysaccounts,cn=etc,dc=example,dc=internal"
+      bind_password_secret: "vault:secret/idm/ldap-bind-password"
+      user_base_dn:  "cn=users,cn=accounts,dc=example,dc=internal"
+      group_base_dn: "cn=groups,cn=accounts,dc=example,dc=internal"
+      groups:
+        - { name: "ocp-hub-admins",    description: "OCP Hub cluster admins"           }
+        - { name: "ocp-hub-viewers",   description: "OCP Hub read-only"                }
+        - { name: "ocp-spoke-admins",  description: "OCP Spoke cluster admins"         }
+        - { name: "platform-ops",      description: "Platform operations"              }
+        - { name: "vdi-users",         description: "VDI access"                       }
+        - { name: "gitlab-admins",     description: "GitLab administrators"            }
+        - { name: "gitlab-developers", description: "GitLab developer access"          }
+        - { name: "jira-admins",       description: "Jira administrators"              }
+        - { name: "jira-users",        description: "Jira users"                       }
+        - { name: "confluence-admins", description: "Confluence administrators"        }
+        - { name: "confluence-users",  description: "Confluence users"                 }
+        - { name: "aap-admins",        description: "AAP administrators"               }
+        - { name: "aap-operators",     description: "AAP automation operators"         }
+
+    dns:
+      # Static records beyond what IDM auto-creates during install
+      extra_records:
+        - { name: "vcenter",              type: A,     value: "10.0.10.50",  zone: "example.internal" }
+        - { name: "bootstrap",            type: A,     value: "10.0.10.5",   zone: "example.internal" }
+        - { name: "registry",             type: A,     value: "10.0.10.11",  zone: "example.internal" }
+        - { name: "flasharray-01-mgmt",   type: A,     value: "10.0.10.40",  zone: "example.internal" }
+        - { name: "flashblade-01-mgmt",   type: A,     value: "10.0.10.41",  zone: "example.internal" }
+        - { name: "flashblade-01-s3",     type: A,     value: "10.0.60.22",  zone: "example.internal" }
+        - { name: "api.hub",              type: A,     value: "10.0.20.5",   zone: "example.internal" }
+        - { name: "*.apps.hub",           type: A,     value: "10.0.20.6",   zone: "example.internal" }
+        # Spoke DNS records added dynamically per spoke during spoke_clusters phase
+
+  dhcp:
+    vm:
+      hostname: "dhcp-01"
+      fqdn: "dhcp-01.mgmt.example.internal"
+      ip: "10.0.10.30"
+      gold_image: "rhel9_minimal"
+      vsphere:
+        datastore: "pure-vmfs-mgmt"
+        network: "PG-Management"
+        folder: "Platform/Management"
+      resources:
+        cpu: 2
+        memory_gb: 4
+        disks:
+          - { size_gb: 50, label: "os", datastore: "pure-vmfs-mgmt" }
+
+    kea:
+      config_dir: "/etc/kea"
+      lease_db:
+        type: "mysql"
+        host: "localhost"
+        name: "kea_leases"
+        user: "kea"
+        password_secret: "vault:secret/kea/db-password"
+      ha:
+        enabled: false
+      # Scopes reference inventory.network.segments by name for gateway/DNS
+      subnets:
+        - id: 10
+          segment: "management"
+          pools: [{ start: "10.0.10.100", end: "10.0.10.200" }]
+          lease_time: 86400
+        - id: 20
+          segment: "ocp_hub"
+          pools: [{ start: "10.0.20.100", end: "10.0.20.250" }]
+          lease_time: 86400
+        - id: 99
+          segment: "provisioning"
+          pools: [{ start: "172.22.0.10", end: "172.22.0.254" }]
+          lease_time: 3600
+        - id: 50
+          segment: "vdi"
+          pools: [{ start: "10.0.50.50", end: "10.0.50.250" }]
+          lease_time: 28800
+        # Spoke subnets added dynamically per spoke during spoke_clusters phase
+
+
+##############################################################################
+# HUB CLUSTER
+##############################################################################
+
+hub_cluster:
+  name: "hub"
+  base_domain: "example.internal"
+  version_ref: "ocp_release"               # Resolved from platform-manifest.yaml
+
+  # ── Platform ────────────────────────────────────────────────────────────────
+  # type: vsphere   → IPI on vSphere; VMs created on vmware.vcenter cluster.
+  #                   inventory.compute hub-node-* BMC entries are NOT used.
+  # type: baremetal → Assisted Installer IPI; inventory.compute hub-node-* servers
+  #                   are provisioned directly via BMC.
+  platform:
+    type: "vsphere"                          # vsphere | baremetal
+
+    vsphere:
+      vcenter: "vcenter.mgmt.example.internal"
+      datacenter: "DC-Primary"
+      cluster: "Compute-Cluster-01"
+      datastore: "pure-vmfs-ocp-hub"
+      network: "PG-OCP-Hub"
+      folder: "Platform/Hub"
+      credentials_secret: "vault:secret/vmware/vcenter-creds"
+      disk_type: "thick"
+
+    baremetal:
+      provisioning_network:
+        segment: "provisioning"              # References inventory.network.segments
+        interface_name: "eno1"
+      deploy_kernel_url:  "http://172.22.0.1:6180/images/ironic-agent.kernel"
+      deploy_ramdisk_url: "http://172.22.0.1:6180/images/ironic-agent.initramfs"
+
+  # ── Network ─────────────────────────────────────────────────────────────────
+  cluster_network: { cidr: "10.128.0.0/14", host_prefix: 23 }
+  service_network:  { cidr: "172.30.0.0/16" }
+  machine_network:  { cidr: "10.0.20.0/24" }
+  api_vip:     "10.0.20.5"
+  ingress_vip: "10.0.20.6"
+
+  install_config:
+    fips: false
+    additional_trust_bundle_path: "/etc/pki/ca-trust/source/anchors/internal-ca.crt"
+    image_content_sources: "{{mirror_registry.registry.image_content_sources}}"
+
+  # ── Node Layout ─────────────────────────────────────────────────────────────
+  # topology: schedulable_masters  → 3 masters, no separate workers (compact)
+  #           masters_and_workers  → 3 masters + N workers
+  #           masters_infra_workers → 3 masters + infra-tainted nodes + workers
+  node_topology: "masters_infra_workers"
+
+  nodes:
+    control_plane:
+      replicas: 3
+      # vsphere: vm_profile used; baremetal: server + bmc_ref used
+      vm_profile:
+        cpu: 8
+        memory_gb: 32
+        disk_gb: 120
+        gold_image: "rhel9_ocp_node"
+        datastore: "pure-vmfs-ocp-hub"
+      nodes:
+        - hostname: "hub-master-01"
+          ip: "10.0.20.11"
+          server_ref: "hub-node-01"          # inventory.compute key (baremetal only)
+          boot_mac_address: "AA:BB:CC:00:11:01"
+        - hostname: "hub-master-02"
+          ip: "10.0.20.12"
+          server_ref: "hub-node-02"
+          boot_mac_address: "AA:BB:CC:00:12:01"
+        - hostname: "hub-master-03"
+          ip: "10.0.20.13"
+          server_ref: "hub-node-03"
+          boot_mac_address: "AA:BB:CC:00:13:01"
+
+    infra:
+      enabled: true
+      replicas: 3
+      taint: "node-role.kubernetes.io/infra:NoSchedule"
+      labels:
+        node-role.kubernetes.io/infra: ""
+      vm_profile:
+        cpu: 8
+        memory_gb: 32
+        disk_gb: 120
+        gold_image: "rhel9_ocp_node"
+        datastore: "pure-vmfs-ocp-hub"
+      # Infra nodes run: router/ingress, internal registry, monitoring stack
+      node_selectors_applied:
+        - ingresscontroller
+        - image-registry
+        - cluster-monitoring
+
+    workers:
+      replicas: 3
+      vm_profile:
+        cpu: 8
+        memory_gb: 32
+        disk_gb: 120
+        gold_image: "rhel9_ocp_node"
+        datastore: "pure-vmfs-ocp-hub"
+
+  # ── Storage (hub-specific) ──────────────────────────────────────────────────
+  storage:
+    pure_csi:
+      enabled: true
+      arrays: ["flasharray-01"]              # References inventory.storage entries
+      blades: ["flashblade-01"]
+      chart_ref: "pure-pso"
+      namespace: "pure-csi"
+      storage_classes:
+        - name: "pure-block-rwo"
+          backend: "flasharray-01"
+          type: "block"
+          reclaim_policy: "Delete"
+          volume_binding_mode: "WaitForFirstConsumer"
+          fstype: "xfs"
+          is_default: true
+        - name: "pure-file-rwx"
+          backend: "flashblade-01"
+          type: "file"
+          reclaim_policy: "Delete"
+          volume_binding_mode: "Immediate"
+          nfs_version: "4.1"
+          is_default: false
+
+    odf:
+      enabled: true
+      mode: "internal"
+      storage_class_for_device_sets: "pure-block-rwo"
+      device_sets:
+        - { name: "ocs-deviceset", count: 3, volume_size: "500Gi" }
+      mcg:
+        backing_store:
+          type: "flashblade"
+          blade: "flashblade-01"
+          bucket: "ocp-mcg-backing"
+          credentials_secret: "vault:secret/storage/flashblade-s3-mcg"
+
+    # S3 buckets provisioned on FlashBlade for hub platform services
+    # Installer creates these via FlashBlade management API during phase 5
+    s3_buckets:
+      - { name: "ocp-image-registry",    blade: "flashblade-01", credentials_secret: "vault:secret/storage/flashblade-s3-registry"      }
+      - { name: "loki-logs",             blade: "flashblade-01", credentials_secret: "vault:secret/storage/flashblade-s3-loki"           }
+      - { name: "thanos-ruler",          blade: "flashblade-01", credentials_secret: "vault:secret/storage/flashblade-s3-thanos"         }
+      - { name: "velero-backup",         blade: "flashblade-01", credentials_secret: "vault:secret/storage/flashblade-s3-velero",     versioning: true }
+      - { name: "gitlab-artifacts",      blade: "flashblade-01", credentials_secret: "vault:secret/storage/flashblade-s3-gitlab"         }
+      - { name: "artifactory-blobs",     blade: "flashblade-01", credentials_secret: "vault:secret/storage/flashblade-s3-artifactory"    }
+      - { name: "ocp-mcg-backing",       blade: "flashblade-01", credentials_secret: "vault:secret/storage/flashblade-s3-mcg"           }
+
+  # ── Authentication ──────────────────────────────────────────────────────────
+  authentication:
+    type: "ldap"
+    ldap:
+      url: "ldaps://idm-01.mgmt.example.internal:636"
+      bind_dn: "uid=svc-ocp-ldap,cn=sysaccounts,cn=etc,dc=example,dc=internal"
+      bind_password_secret: "vault:secret/idm/ldap-bind-password"
+      attributes:
+        id: ["dn"]
+        email: ["mail"]
+        name: ["cn"]
+        preferred_username: ["uid"]
+      group_sync:
+        enabled: true
+        schedule: "*/30 * * * *"
+        groups:
+          - { ldap_group: "ocp-hub-admins",  ocp_role: "cluster-admin" }
+          - { ldap_group: "ocp-hub-viewers", ocp_role: "view"          }
+          - { ldap_group: "platform-ops",    ocp_role: "cluster-admin" }
+
+  # ── Core OCP Operators ──────────────────────────────────────────────────────
+  # Platform-level operators required by hub_services below.
+  # Application-level service operators are declared inside each hub_services entry.
+  operators:
+    - { name: "advanced-cluster-management",      channel: "release-2.11",  catalog: "redhat-operator-index", namespace: "open-cluster-management",  approval: "Automatic" }
+    - { name: "openshift-gitops-operator",         channel: "latest",        catalog: "redhat-operator-index", namespace: "openshift-gitops",          approval: "Automatic" }
+    - { name: "topology-aware-lifecycle-manager",  channel: "stable",        catalog: "redhat-operator-index", namespace: "ztp-install",               approval: "Automatic" }
+    - { name: "local-storage-operator",            channel: "stable",        catalog: "redhat-operator-index", namespace: "openshift-local-storage",   approval: "Automatic" }
+    - { name: "odf-operator",                      channel: "stable-4.16",   catalog: "redhat-operator-index", namespace: "openshift-storage",         approval: "Automatic" }
+    - { name: "metallb-operator",                  channel: "stable",        catalog: "redhat-operator-index", namespace: "metallb-system",            approval: "Automatic" }
+
+
+##############################################################################
+# HUB SERVICES
+# All services deployed into the hub cluster.
+# Each service is independently enabled/disabled.
+# Services are deployed in dependency order; the installer resolves the graph.
+# All storage_class references resolve to hub_cluster.storage.pure_csi
+# storage_classes or ODF classes unless overridden.
+##############################################################################
+
+hub_services:
+
+  # ── Vault ───────────────────────────────────────────────────────────────────
+  vault:
+    enabled: true
+    namespace: "vault"
+    chart_ref: "vault"
+    helm_values:
+      server:
+        ha: { enabled: true, replicas: 3, raft: { enabled: true } }
+        dataStorage:  { storageClass: "pure-block-rwo", size: "10Gi" }
+        auditStorage: { storageClass: "pure-block-rwo", size: "10Gi", enabled: true }
+      injector: { enabled: true }
+    migration:
+      source_vault_addr: "https://bootstrap.mgmt.example.internal:8200"
+      migrate_mounts: ["secret", "pki"]
+    route:
+      hostname: "vault.apps.hub.example.internal"
+      tls_termination: "reencrypt"
+    admin_password_secret: "vault:secret/hub/vault-admin"
+
+  # ── Artifactory ─────────────────────────────────────────────────────────────
+  artifactory:
+    enabled: true
+    namespace: "artifactory"
+    chart_ref: "artifactory-oss"
+    helm_values:
+      artifactory:
+        persistence: { storageClass: "pure-block-rwo", size: "100Gi" }
+        blobstore_s3:
+          endpoint: "https://flashblade-01-s3.mgmt.example.internal"
+          bucket: "artifactory-blobs"
+          credentials_secret: "vault:secret/storage/flashblade-s3-artifactory"
+    migration:
+      source_url: "https://bootstrap.mgmt.example.internal:8082"
+      repos_to_migrate: ["rpms-local", "helm-local", "generic-local"]
+    route:
+      hostname: "artifactory.apps.hub.example.internal"
+      tls_termination: "edge"
+    admin_password_secret: "vault:secret/bootstrap/artifactory-admin"
+    repositories:
+      - { name: "rpms-local",    type: "local", package_type: "rpm"     }
+      - { name: "helm-local",    type: "local", package_type: "helm"    }
+      - { name: "generic-local", type: "local", package_type: "generic" }
+
+  # ── GitLab ──────────────────────────────────────────────────────────────────
+  gitlab:
+    enabled: true
+    namespace: "gitlab"
+    chart_ref: "gitlab"
+    deployment_method: "acm_policy"          # acm_policy | helm_direct
+    edition: "ee"                            # ee | ce
+    route:
+      hostname: "gitlab.apps.hub.example.internal"
+      tls_termination: "edge"
+    admin_password_secret: "vault:secret/gitlab/admin-password"
+    ldap:
+      enabled: true
+      server: "idm-01.mgmt.example.internal"
+      port: 636
+      bind_dn: "uid=svc-ocp-ldap,cn=sysaccounts,cn=etc,dc=example,dc=internal"
+      bind_password_secret: "vault:secret/idm/ldap-bind-password"
+      base_dn: "cn=users,cn=accounts,dc=example,dc=internal"
+      group_base_dn: "cn=groups,cn=accounts,dc=example,dc=internal"
+      admin_group: "gitlab-admins"
+    storage:
+      postgres:  { storageClass: "pure-block-rwo", size: "50Gi" }
+      redis:     { storageClass: "pure-block-rwo", size: "5Gi"  }
+      gitaly:    { storageClass: "pure-file-rwx",  size: "200Gi" }  # RWX for HA Gitaly
+      object_storage:
+        bucket: "gitlab-artifacts"
+        endpoint: "https://flashblade-01-s3.mgmt.example.internal"
+        credentials_secret: "vault:secret/storage/flashblade-s3-gitlab"
+    runners:
+      enabled: true
+      executor: "kubernetes"
+      namespace: "gitlab-runners"
+      concurrent: 10
+      image_ref: "registry.example.internal:5000/platform/gitlab-runner"
+
+  # ── Jira ────────────────────────────────────────────────────────────────────
+  jira:
+    enabled: true
+    namespace: "jira"
+    chart_ref: "jira"
+    route:
+      hostname: "jira.apps.hub.example.internal"
+      tls_termination: "edge"
+    admin_password_secret: "vault:secret/jira/admin-password"
+    ldap:
+      enabled: true
+      url: "ldaps://idm-01.mgmt.example.internal:636"
+      user_dn: "cn=users,cn=accounts,dc=example,dc=internal"
+      group_dn: "cn=groups,cn=accounts,dc=example,dc=internal"
+      bind_dn: "uid=svc-ocp-ldap,cn=sysaccounts,cn=etc,dc=example,dc=internal"
+      bind_password_secret: "vault:secret/idm/ldap-bind-password"
+      admin_group: "jira-admins"
+      user_group: "jira-users"
+    storage:
+      home:     { storageClass: "pure-block-rwo", size: "50Gi"  }
+      postgres: { storageClass: "pure-block-rwo", size: "100Gi" }
+
+  # ── Confluence ──────────────────────────────────────────────────────────────
+  confluence:
+    enabled: true
+    namespace: "confluence"
+    chart_ref: "confluence"
+    route:
+      hostname: "confluence.apps.hub.example.internal"
+      tls_termination: "edge"
+    admin_password_secret: "vault:secret/confluence/admin-password"
+    ldap:
+      enabled: true
+      url: "ldaps://idm-01.mgmt.example.internal:636"
+      user_dn: "cn=users,cn=accounts,dc=example,dc=internal"
+      bind_dn: "uid=svc-ocp-ldap,cn=sysaccounts,cn=etc,dc=example,dc=internal"
+      bind_password_secret: "vault:secret/idm/ldap-bind-password"
+      admin_group: "confluence-admins"
+      user_group: "confluence-users"
+    storage:
+      home:          { storageClass: "pure-file-rwx",  size: "100Gi" }  # RWX — Confluence shared home
+      attachments:
+        type: "s3"
+        bucket: "gitlab-artifacts"           # Reuse or define dedicated bucket
+        endpoint: "https://flashblade-01-s3.mgmt.example.internal"
+        credentials_secret: "vault:secret/storage/flashblade-s3-gitlab"
+      postgres: { storageClass: "pure-block-rwo", size: "50Gi" }
+
+  # ── Ansible Automation Platform (AAP) ──────────────────────────────────────
+  aap:
+    enabled: true
+    namespace: "aap"
+    operator:
+      name: "ansible-automation-platform-operator"
+      channel: "stable-2.4"
+      catalog: "redhat-operator-index"
+      approval: "Automatic"
+    controller:
+      replicas: 2
+      admin_password_secret: "vault:secret/aap/admin-password"
+      ldap:
+        enabled: true
+        server_uri: "ldaps://idm-01.mgmt.example.internal:636"
+        bind_dn: "uid=svc-ocp-ldap,cn=sysaccounts,cn=etc,dc=example,dc=internal"
+        bind_password_secret: "vault:secret/idm/ldap-bind-password"
+        user_search_dn: "cn=users,cn=accounts,dc=example,dc=internal"
+        group_search_dn: "cn=groups,cn=accounts,dc=example,dc=internal"
+        admin_group: "aap-admins"
+      storage: { storageClass: "pure-block-rwo", size: "20Gi" }
+      route:
+        hostname: "aap.apps.hub.example.internal"
+        tls_termination: "edge"
+    hub:
+      enabled: true
+      storage:
+        file:   { storageClass: "pure-file-rwx",  size: "100Gi" }
+        object:
+          bucket: "gitlab-artifacts"
+          endpoint: "https://flashblade-01-s3.mgmt.example.internal"
+          credentials_secret: "vault:secret/storage/flashblade-s3-gitlab"
+      route:
+        hostname: "aap-hub.apps.hub.example.internal"
+        tls_termination: "edge"
+    eda:                                     # Event-Driven Ansible
+      enabled: true
+      route:
+        hostname: "eda.apps.hub.example.internal"
+        tls_termination: "edge"
+
+  # ── ELK (Elasticsearch + Logstash + Kibana via ECK) ─────────────────────────
+  elk:
+    enabled: true
+    namespace: "elastic-system"
+    operator:
+      name: "elasticsearch-eck-operator-certified"
+      channel: "stable"
+      catalog: "certified-operator-index"
+      approval: "Automatic"
+    elasticsearch:
+      version: "8.13.0"                      # Version pinned in manifest
+      node_count: 3
+      storage: { storageClass: "pure-block-rwo", size: "500Gi" }
+      resources:
+        requests:  { cpu: "2",  memory: "8Gi"  }
+        limits:    { cpu: "4",  memory: "16Gi" }
+    kibana:
+      enabled: true
+      replicas: 2
+      route:
+        hostname: "kibana.apps.hub.example.internal"
+        tls_termination: "edge"
+      ldap:
+        enabled: true
+        url: "ldaps://idm-01.mgmt.example.internal:636"
+        bind_dn: "uid=svc-ocp-ldap,cn=sysaccounts,cn=etc,dc=example,dc=internal"
+        bind_password_secret: "vault:secret/idm/ldap-bind-password"
+        base_dn: "dc=example,dc=internal"
+    logstash:
+      enabled: false
+      # Enable if log transformation pipeline is required before ES ingest
+    # Platform log sources shipped to ELK via Fluentd/Vector forwarding rules
+    log_sources:
+      - hub_cluster_audit
+      - hub_cluster_infrastructure
+      - hub_cluster_application
+      - spoke_cluster_forwarding   # Spokes forward to hub ELK via ClusterLogForwarder
+
+  # ── OpenShift Service Mesh (Istio) ──────────────────────────────────────────
+  service_mesh:
+    enabled: true
+    namespace: "istio-system"
+    operator:
+      name: "servicemeshoperator"
+      channel: "stable"
+      catalog: "redhat-operator-index"
+      approval: "Automatic"
+    control_plane:
+      version: "2.6"
+      mtls: { enabled: true, auto: true }
+      tracing:
+        type: "Jaeger"
+        sampling_rate: 100
+      members:                               # Namespaces enrolled in the mesh
+        - "gitlab"
+        - "aap"
+        - "vault"
+    kiali:
+      enabled: true
+      route:
+        hostname: "kiali.apps.hub.example.internal"
+        tls_termination: "edge"
+
+  # ── Advanced Cluster Security (ACS / StackRox) ──────────────────────────────
+  acs:
+    enabled: true
+    namespace: "stackrox"
+    operator:
+      name: "rhacs-operator"
+      channel: "stable"
+      catalog: "redhat-operator-index"
+      approval: "Automatic"
+    central:
+      admin_password_secret: "vault:secret/acs/admin-password"
+      persistence: { storageClass: "pure-block-rwo", size: "100Gi" }
+      route:
+        hostname: "acs.apps.hub.example.internal"
+        tls_termination: "reencrypt"
+      ldap:
+        enabled: true
+        url: "ldaps://idm-01.mgmt.example.internal:636"
+        bind_dn: "uid=svc-ocp-ldap,cn=sysaccounts,cn=etc,dc=example,dc=internal"
+        bind_password_secret: "vault:secret/idm/ldap-bind-password"
+        base_dn: "dc=example,dc=internal"
+    secured_clusters:
+      # ACS SecuredCluster deployed to hub and auto-enrolled to each spoke via ACM policy
+      - cluster: "hub"
+      # Spoke SecuredClusters provisioned automatically via ACM policy during spoke_clusters phase
+
+  # ── Anchore Enterprise (container image scanning) ───────────────────────────
+  anchore:
+    enabled: true
+    namespace: "anchore"
+    chart_ref: "anchore-enterprise"
+    admin_password_secret: "vault:secret/anchore/admin-password"
+    route:
+      hostname: "anchore.apps.hub.example.internal"
+      tls_termination: "edge"
+    ldap:
+      enabled: true
+      url: "ldaps://idm-01.mgmt.example.internal:636"
+      bind_dn: "uid=svc-ocp-ldap,cn=sysaccounts,cn=etc,dc=example,dc=internal"
+      bind_password_secret: "vault:secret/idm/ldap-bind-password"
+      base_dn: "dc=example,dc=internal"
+    storage:
+      postgres: { storageClass: "pure-block-rwo", size: "100Gi" }
+      feeds_sync:
+        # In disconnected mode: feeds served from a pre-populated local feed service
+        mode: "local"                        # local | offline_archive
+        local_feed_url: "https://anchore-feeds.mgmt.example.internal"
+    integrations:
+      gitlab_registry: true                  # Auto-scan images pushed to GitLab registry
+      acs_integration: true                  # Feed scan results into ACS image policies
+
+  # ── ODF (already declared under hub_cluster.storage; referenced here for
+  #    service-level config like MCG route and Noobaa S3 endpoint) ─────────────
+  odf:
+    enabled: true
+    namespace: "openshift-storage"
+    # Physical config lives in hub_cluster.storage.odf
+    # Service-level config here
+    mcg_route:
+      hostname: "s3.apps.hub.example.internal"
+      tls_termination: "reencrypt"
+    rgw_route:
+      enabled: false                         # Disabled — FlashBlade S3 is primary object store
+
+  # ── Local Storage Operator (for ODF device sets or dedicated PVs) ───────────
+  local_storage:
+    enabled: true
+    namespace: "openshift-local-storage"
+    # Config managed by hub_cluster.storage — this entry just ensures the
+    # operator is installed and tracked as a service
+
+  # ── GitOps / ArgoCD ─────────────────────────────────────────────────────────
+  gitops:
+    enabled: true
+    namespace: "openshift-gitops"
+    admin_password_secret: "vault:secret/gitops/admin-password"
+    git_backend:
+      type: "gitlab"
+      url: "https://gitlab.apps.hub.example.internal"
+      credentials_secret: "vault:secret/gitops/gitlab-token"
+    applications:
+      - name: "hub-operators"
+        repo: "https://gitlab.apps.hub.example.internal/platform/platform-manifests.git"
+        path: "operators/hub"
+        target_namespace: "openshift-operators"
+        sync_policy: "automated"
+      - name: "hub-services"
+        repo: "https://gitlab.apps.hub.example.internal/platform/platform-manifests.git"
+        path: "services/hub"
+        target_namespace: "hub-services"
+        sync_policy: "automated"
+      - name: "ztp-spoke-apps"
+        repo: "https://gitlab.apps.hub.example.internal/platform/ztp-config.git"
+        path: "siteconfig"
+        target_namespace: "ztp-install"
+        sync_policy: "automated"
+
+  # ── Observability (monitoring + logging) ─────────────────────────────────────
+  observability:
+    monitoring:
+      enabled: true
+      storage_class: "pure-block-rwo"
+      prometheus_retention: "15d"
+      thanos_object_storage:
+        bucket: "thanos-ruler"
+        endpoint: "https://flashblade-01-s3.mgmt.example.internal"
+        credentials_secret: "vault:secret/storage/flashblade-s3-thanos"
+      alertmanager:
+        enabled: true
+        receivers:
+          - name: "platform-ops"
+            email:
+              to: "ops@example.internal"
+              from: "alerts@example.internal"
+              smarthost: "smtp.example.internal:587"
+      acm_observability:
+        enabled: true
+        storage_class: "pure-block-rwo"
+        retention_resolution_raw: "5d"
+        retention_resolution_1h:  "30d"
+
+    logging:
+      enabled: true
+      operator: "cluster-logging"
+      namespace: "openshift-logging"
+      log_store: "loki"                      # loki | elasticsearch
+      loki:
+        storage_class: "pure-block-rwo"
+        size: "1x.small"                     # 1x.small | 1x.medium | 1x.large
+        object_storage:
+          bucket: "loki-logs"
+          endpoint: "https://flashblade-01-s3.mgmt.example.internal"
+          credentials_secret: "vault:secret/storage/flashblade-s3-loki"
+
+  # ── ACM (config lives here as a hub service; operator in hub_cluster.operators)
+  acm:
+    enabled: true
+    namespace: "open-cluster-management"
+    multicluster_hub:
+      name: "multiclusterhub"
+      availability_config: "High"
+      enable_cluster_backup: true
+      backup_storage:
+        bucket: "velero-backup"
+        endpoint: "https://flashblade-01-s3.mgmt.example.internal"
+        credentials_secret: "vault:secret/storage/flashblade-s3-velero"
+    assisted_service:
+      image_storage_class: "pure-block-rwo"
+      os_images:
+        - openshift_version_ref: "ocp_release"
+          url: "http://registry.example.internal:8080/rhcos-live.x86_64.iso"
+          rootfs_url: "http://registry.example.internal:8080/rhcos-live-rootfs.x86_64.img"
+          cpu_architecture: "x86_64"
+    infrastructure_environment:
+      name: "ztp-infra-env"
+      namespace: "ztp-install"
+      pull_secret_ref: "assisted-deployment-pull-secret"
+      additional_trust_bundle_ref: "internal-ca-bundle"
+
+
+##############################################################################
+# SPOKE CLUSTERS
+##############################################################################
+
+spoke_clusters:
+  defaults:
+    version_ref: "ocp_release"
+    cluster_network: { cidr: "10.132.0.0/14", host_prefix: 23 }
+    service_network:  { cidr: "172.31.0.0/16" }
+    fips: false
+    dns_servers: ["10.0.10.20", "10.0.10.21"]
+    ntp_sources: ["ntp1.example.internal"]
+    image_content_sources: "{{mirror_registry.registry.image_content_sources}}"
+    additional_trust_bundle_path: "/etc/pki/ca-trust/source/anchors/internal-ca.crt"
+    # Default: Pure CSI only; ODF opt-in per spoke
+    storage:
+      pure_csi:
+        enabled: true
+        arrays: ["flasharray-01"]
+        blades: ["flashblade-01"]
+        chart_ref: "pure-pso"
+        namespace: "pure-csi"
+        default_block_storage_class: "pure-block-rwo"
+        default_file_storage_class:  "pure-file-rwx"
+      odf: { enabled: false }
+    # ACS SecuredCluster deployed to every spoke automatically
+    acs_secured_cluster: { enabled: true }
+    ztp:
+      gitops_repo: "https://gitlab.apps.hub.example.internal/platform/ztp-config.git"
+      site_config_path: "siteconfig"
+      policy_gen_template_path: "policygentemplates"
+      argocd_app_name: "ztp-spoke-apps"
+
+  clusters: []
+
+  # ─── Example spoke entries ────────────────────────────────────────────────
+  #
+  # ── SNO (bare metal) ─────────────────────────────────────────────────────
+  # - name: "spoke-01"
+  #   base_domain: "example.internal"
+  #   site_id: "site-alpha"
+  #   cluster_type: "sno"               # sno | compact | standard
+  #   machine_network: { cidr: "10.0.30.0/24" }
+  #   api_vip: ""                        # Not used for SNO
+  #   ingress_vip: ""
+  #   platform:
+  #     type: "baremetal"
+  #     baremetal:
+  #       provisioning_network: { segment: "provisioning", interface_name: "eno1" }
+  #   nodes:
+  #     - hostname: "spoke-01-node-01"
+  #       role: "master"
+  #       ip: "10.0.30.10"
+  #       server_ref: "spoke-node-01"    # inventory.compute key
+  #       boot_mac_address: "AA:BB:CC:00:21:01"
+  #       root_device_hint: { device_name: "/dev/nvme0n1" }
+  #   # Inherits defaults.storage (Pure CSI only)
+  #
+  # ── Compact 3-node (vSphere) ─────────────────────────────────────────────
+  # - name: "spoke-02"
+  #   base_domain: "example.internal"
+  #   site_id: "site-beta"
+  #   cluster_type: "compact"
+  #   machine_network: { cidr: "10.0.31.0/24" }
+  #   api_vip: "10.0.31.5"
+  #   ingress_vip: "10.0.31.6"
+  #   platform:
+  #     type: "vsphere"
+  #     vsphere:
+  #       vcenter: "vcenter.mgmt.example.internal"
+  #       datacenter: "DC-Primary"
+  #       cluster: "Compute-Cluster-01"
+  #       datastore: "pure-vmfs-mgmt"
+  #       network: "PG-OCP-Spoke-Trunk"
+  #       folder: "Platform/Spoke-02"
+  #       credentials_secret: "vault:secret/vmware/vcenter-creds"
+  #   nodes:
+  #     - { hostname: "spoke-02-master-01", role: "master", ip: "10.0.31.11",
+  #         vm_profile: { cpu: 8, memory_gb: 32, disk_gb: 120, gold_image: "rhel9_ocp_node" } }
+  #     - { hostname: "spoke-02-master-02", role: "master", ip: "10.0.31.12",
+  #         vm_profile: { cpu: 8, memory_gb: 32, disk_gb: 120, gold_image: "rhel9_ocp_node" } }
+  #     - { hostname: "spoke-02-master-03", role: "master", ip: "10.0.31.13",
+  #         vm_profile: { cpu: 8, memory_gb: 32, disk_gb: 120, gold_image: "rhel9_ocp_node" } }
+  #   overrides:
+  #     storage:
+  #       odf: { enabled: true, device_sets: [{ count: 3, volume_size: "200Gi" }] }
+
+
+##############################################################################
+# VDI SERVICES
+##############################################################################
+
+vdi_services:
+  enabled: false                             # Set true to activate VDI deployment
+  platform: "vmware"                         # vmware | openshift_virtualization
+
+  vmware:
+    vsphere:
+      datacenter: "DC-Primary"
+      cluster: "Compute-Cluster-01"
+      datastore: "pure-vmfs-vdi"
+      network: "PG-VDI"
+      folder: "Platform/VDI"
+    base_image: "rhel9_base"
+    linked_clone_base_datastore: "pure-nfs-shared"
+    pool:
+      name: "vdi-pool-01"
+      count: 10
+      cpu: 4
+      memory_gb: 8
+      disk_gb: 60
+      ip_range_start: "10.0.50.100"
+      ip_range_end:   "10.0.50.200"
+    linked_clones: true
+
+  openshift_virtualization:
+    target_cluster: "hub"
+    namespace: "vdi-workloads"
+    operator:
+      name: "kubevirt-hyperconverged"
+      channel: "stable"
+      catalog: "redhat-operator-index"
+    vm_template:
+      base_image_pvc: "rhel9-base-gold"
+      storage_class: "pure-block-rwo"
+    pool:
+      count: 10
+      cpu_cores: 4
+      memory_gb: 8
+      root_disk_size: "60Gi"
+
+  migration:
+    enabled: false
+    mtv:
+      source_provider:
+        type: "vsphere"
+        vcenter_host: "vcenter.mgmt.example.internal"
+        credentials_secret: "vault:secret/vmware/vcenter-creds"
+        thumbprint: ""
+      migration_plan:
+        name: "vdi-vmware-to-ocpvirt"
+        target_namespace: "vdi-workloads"
+        vms: []
+
+
+##############################################################################
+# SECRETS BACKEND
+##############################################################################
+
+secrets:
+  backend: "vault"
+  vault:
+    bootstrap_addr: "https://bootstrap.mgmt.example.internal:8200"
+    hub_addr:       "https://vault.apps.hub.example.internal"
+    auth_method: "approle"
+    role_id_env:   "VAULT_ROLE_ID"
+    secret_id_env: "VAULT_SECRET_ID"
+    ca_cert_path: "/etc/pki/ca-trust/source/anchors/internal-ca.crt"
+    namespace: ""
+
+
+##############################################################################
+# PREFLIGHT CHECKS
+##############################################################################
+
+preflight:
+  fail_fast: true
+  checks:
+    - id: "manifest_version_match"
+      description: "platform-manifest.yaml version matches platform_manifest.version"
+    - id: "staged_assets_checksums"
+      description: "All gold images, ISOs, OLM catalogs match manifest SHA-256 pins"
+    - id: "pull_secret_valid"
+      description: "pull-secret.json contains auth entry for mirror registry"
+    - id: "vault_env_set"
+      description: "VAULT_ROLE_ID and VAULT_SECRET_ID env vars are non-empty"
+    - id: "bmc_reachable"
+      description: "Redfish/IPMI responds for every server in inventory.compute"
+    - id: "flasharray_api_reachable"
+      description: "FlashArray management API reachable for all arrays"
+    - id: "flashblade_api_reachable"
+      description: "FlashBlade management API reachable for all blades"
+    - id: "flashblade_s3_reachable"
+      description: "FlashBlade S3 endpoint reachable for all blades"
+    - id: "disk_space_staging"
+      description: "Staging root has >= 600 GB free"
+      threshold_gb: 600
+    - id: "oob_network_reachable"
+      description: "All BMC IPs in inventory.compute.*.bmc.address are pingable"
+    - id: "ntp_reachable"
+      description: "All NTP servers respond on UDP 123"
+    - id: "ssh_key_exists"
+      description: "global.ssh public and private key paths both exist and are valid"
+    - id: "internal_ca_exists"
+      description: "global.tls CA cert and key paths both exist"
+    - id: "no_duplicate_server_claims"
+      description: "No inventory.compute server is claimed by more than one logical section"
+    - id: "no_duplicate_ips"
+      description: "All statically assigned IPs across all logical sections are unique"
+
+##############################################################################
+# END OF CONFIGURATION
+##############################################################################

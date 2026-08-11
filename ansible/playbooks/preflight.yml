@@ -1,0 +1,205 @@
+---
+# ansible/playbooks/preflight.yml
+#
+# Preflight checks — run before any infrastructure is touched.
+# All checks are driven by vars generated from platform-config.yaml
+# by ConfigLoader.generate_ansible_vars().
+#
+# Variables consumed (from group_vars/generated/all.yml):
+#   platform_global.*
+#   platform_assets.*
+#   platform_manifest.*
+#   platform_inventory_compute.*
+#   platform_inventory_storage.*
+#   platform_preflight.*
+
+- name: "Preflight | Validate staged assets and reachability"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: "Preflight | Check manifest version match"
+      ansible.builtin.assert:
+        that:
+          - platform_manifest.manifest_version == platform_global.environment_name is defined
+        fail_msg: >
+          Manifest version mismatch.
+          platform-config.yaml expects {{ platform_manifest.manifest_version }}
+          but loaded manifest declares a different version.
+      tags: [manifest]
+
+    - name: "Preflight | Verify staging root exists"
+      ansible.builtin.stat:
+        path: "{{ platform_assets.staging_root }}"
+      register: staging_stat
+      tags: [disk_space]
+
+    - name: "Preflight | Assert staging root is a directory"
+      ansible.builtin.assert:
+        that: staging_stat.stat.isdir
+        fail_msg: "Staging root {{ platform_assets.staging_root }} does not exist or is not a directory"
+      tags: [disk_space]
+
+    - name: "Preflight | Check disk space on staging root"
+      ansible.builtin.command:
+        cmd: "df --block-size=G --output=avail {{ platform_assets.staging_root }}"
+      register: df_output
+      changed_when: false
+      tags: [disk_space]
+
+    - name: "Preflight | Assert sufficient disk space"
+      ansible.builtin.assert:
+        that: >
+          (df_output.stdout_lines[1] | regex_replace('G', '') | int) >=
+          (platform_preflight.checks |
+            selectattr('id', 'equalto', 'disk_space_staging') |
+            map(attribute='threshold_gb') | first | default(600))
+        fail_msg: >
+          Insufficient disk space on {{ platform_assets.staging_root }}.
+          Need at least {{ platform_preflight.checks |
+            selectattr('id', 'equalto', 'disk_space_staging') |
+            map(attribute='threshold_gb') | first | default(600) }}G.
+      tags: [disk_space]
+
+    - name: "Preflight | Verify gold images exist and match checksums"
+      ansible.builtin.include_tasks:
+        file: tasks/preflight/check_gold_image.yml
+        apply:
+          tags: [gold_images]
+      loop: "{{ platform_assets.gold_images.images | dict2items }}"
+      loop_control:
+        loop_var: image_item
+        label: "{{ image_item.key }}"
+      tags: [gold_images]
+
+    - name: "Preflight | Verify RHCOS ISO exists"
+      ansible.builtin.stat:
+        path: "{{ platform_assets.staging_root }}/{{ platform_assets.isos.base_path }}/{{ platform_assets.isos.rhcos_live_iso }}"
+      register: iso_stat
+      tags: [isos]
+
+    - name: "Preflight | Assert RHCOS ISO present"
+      ansible.builtin.assert:
+        that: iso_stat.stat.exists
+        fail_msg: "RHCOS ISO not found at expected staging path"
+      tags: [isos]
+
+    - name: "Preflight | Check Vault env vars are set"
+      ansible.builtin.assert:
+        that:
+          - lookup('env', platform_secrets_vault_role_id_env) != ''
+          - lookup('env', platform_secrets_vault_secret_id_env) != ''
+        fail_msg: >
+          VAULT_ROLE_ID and VAULT_SECRET_ID must be set as environment variables.
+      vars:
+        platform_secrets_vault_role_id_env:    "{{ platform_secrets.vault.role_id_env    | default('VAULT_ROLE_ID')    }}"
+        platform_secrets_vault_secret_id_env:  "{{ platform_secrets.vault.secret_id_env  | default('VAULT_SECRET_ID') }}"
+      tags: [vault_env]
+
+    - name: "Preflight | Check BMC reachability for all inventory servers"
+      ansible.builtin.include_tasks:
+        file: tasks/preflight/check_bmc.yml
+        apply:
+          tags: [bmc]
+      loop: "{{ platform_inventory_compute | dict2items }}"
+      loop_control:
+        loop_var: server_item
+        label: "{{ server_item.key }}"
+      tags: [bmc]
+
+    - name: "Preflight | Check FlashArray management API reachability"
+      ansible.builtin.uri:
+        url: "https://{{ item.management.hostname }}/api/2.26/arrays"
+        method: GET
+        validate_certs: false
+        status_code: [200, 401]     # 401 = reachable but not authed — that's fine here
+        timeout: 10
+      loop: "{{ platform_inventory_storage.pure_flash_arrays }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: fa_check
+      failed_when: fa_check.status not in [200, 401]
+      tags: [flasharray]
+
+    - name: "Preflight | Check FlashBlade S3 endpoint reachability"
+      ansible.builtin.uri:
+        url: "{{ item.s3.endpoint_hostname | default('') | ternary('https://' + item.s3.endpoint_hostname, '') }}"
+        method: GET
+        validate_certs: false
+        status_code: [200, 400, 403]
+        timeout: 10
+      loop: "{{ platform_inventory_storage.pure_flash_blades }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.s3.enabled | default(false)
+      tags: [flashblade]
+
+    - name: "Preflight | Check SSH key pair exists"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: ssh_stat
+      loop:
+        - "{{ platform_global.ssh.public_key_path }}"
+        - "{{ platform_global.ssh.private_key_path }}"
+      tags: [ssh]
+
+    - name: "Preflight | Assert SSH keys exist"
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: "SSH key not found: {{ item.item }}"
+      loop: "{{ ssh_stat.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [ssh]
+
+    - name: "Preflight | Check internal CA cert and key exist"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: ca_stat
+      loop:
+        - "{{ platform_global.tls.internal_ca_cert_path }}"
+        - "{{ platform_global.tls.internal_ca_key_path }}"
+      tags: [tls]
+
+    - name: "Preflight | Assert CA files exist"
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: "CA file not found: {{ item.item }}"
+      loop: "{{ ca_stat.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [tls]
+
+    - name: "Preflight | Check NTP servers are reachable"
+      ansible.builtin.command:
+        cmd: "nc -u -z -w 3 {{ item }} 123"
+      loop: "{{ platform_global.ntp_servers }}"
+      register: ntp_check
+      changed_when: false
+      failed_when: ntp_check.rc != 0
+      tags: [ntp]
+
+    - name: "Preflight | Validate pull-secret JSON"
+      ansible.builtin.slurp:
+        src: "{{ platform_global.pull_secret_path }}"
+      register: pull_secret_b64
+      tags: [pull_secret]
+
+    - name: "Preflight | Assert pull secret contains mirror registry auth"
+      ansible.builtin.assert:
+        that:
+          - (pull_secret_b64.content | b64decode | from_json).auths is defined
+          - platform_mirror_registry.registry.fqdn in (pull_secret_b64.content | b64decode | from_json).auths
+        fail_msg: >
+          pull-secret.json does not contain an auth entry for {{ platform_mirror_registry.registry.fqdn }}.
+          Add the mirror registry credentials to your pull secret before running the installer.
+      tags: [pull_secret]
+
+    - name: "Preflight | All checks passed"
+      ansible.builtin.debug:
+        msg: >
+          ✔ All preflight checks passed.
+          Environment: {{ platform_global.environment_name }}
+          Manifest version: {{ platform_manifest.manifest_version }}

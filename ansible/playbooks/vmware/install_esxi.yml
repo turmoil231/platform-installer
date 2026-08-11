@@ -1,0 +1,123 @@
+---
+# ansible/playbooks/vmware/install_esxi.yml
+#
+# Thin orchestration playbook — owns WHAT happens and in what order.
+# HOW it happens lives in the platform.vmware collection (separate repo).
+#
+# This playbook imports roles and tasks from platform.vmware via FQCN.
+# ansible-runner sets ANSIBLE_COLLECTIONS_PATH to the pre-installed
+# collection directory, so no Galaxy calls are made at runtime.
+#
+# Variables consumed (from group_vars/generated/vmware.yml):
+#   platform_vmware.esxi.hosts[]
+#   platform_vmware.esxi.host_profile
+#   platform_vmware.esxi.dvswitch
+#   platform_vmware.esxi.iscsi
+#   platform_global.ntp_servers
+#   platform_global.tls.internal_ca_cert_path
+#
+# The `esxi_hosts` inventory group is populated by ConfigLoader from
+# inventory.compute servers claimed in vmware.esxi.hosts[].server.
+
+- name: "ESXi Install | Mount ISO and boot to installer"
+  hosts: esxi_hosts
+  gather_facts: false
+  serial: 1                                  # Install one host at a time — safe for prod
+
+  tasks:
+    - name: "ESXi Install | Mount RHCOS ISO via virtual media"
+      ansible.builtin.import_role:
+        name: platform.vmware.redfish_virtual_media
+      vars:
+        redfish_image_url: >-
+          http://{{ platform_vmware_bootstrap_ip }}/generic-local/{{ platform_assets.gold_images.images.esxi.filename }}
+        redfish_boot_once: true
+
+    - name: "ESXi Install | Power cycle host"
+      ansible.builtin.import_role:
+        name: platform.vmware.redfish_power
+      vars:
+        redfish_action: "ForceRestart"
+
+    - name: "ESXi Install | Wait for ESXi DCUI to become available"
+      ansible.builtin.import_role:
+        name: platform.vmware.wait_for_esxi
+      vars:
+        esxi_host_ip:    "{{ hostvars[inventory_hostname].management_ip }}"
+        timeout_minutes: 30
+
+
+- name: "ESXi Configure | Apply host profile to all ESXi hosts"
+  hosts: esxi_hosts
+  gather_facts: false
+
+  tasks:
+    - name: "ESXi Configure | Set hostname and management IP"
+      ansible.builtin.import_role:
+        name: platform.vmware.esxi_network
+      vars:
+        esxi_hostname:      "{{ hostvars[inventory_hostname].esxi_hostname }}"
+        esxi_management_ip: "{{ hostvars[inventory_hostname].management_ip }}"
+        esxi_management_nic: "{{ hostvars[inventory_hostname].management_nic }}"
+
+    - name: "ESXi Configure | Configure NTP"
+      ansible.builtin.import_role:
+        name: platform.vmware.esxi_ntp
+      vars:
+        ntp_servers: "{{ platform_global.ntp_servers }}"
+
+    - name: "ESXi Configure | Configure syslog forwarding"
+      ansible.builtin.import_role:
+        name: platform.vmware.esxi_syslog
+      vars:
+        syslog_host: "{{ platform_vmware.esxi.host_profile.syslog_host }}"
+
+    - name: "ESXi Configure | Apply advanced settings from host profile"
+      ansible.builtin.import_role:
+        name: platform.vmware.esxi_advanced_settings
+      vars:
+        advanced_settings: "{{ platform_vmware.esxi.host_profile.advanced_settings }}"
+
+    - name: "ESXi Configure | Trust internal CA"
+      ansible.builtin.import_role:
+        name: platform.vmware.esxi_trust_ca
+      vars:
+        ca_cert_path: "{{ platform_global.tls.internal_ca_cert_path }}"
+
+    - name: "ESXi Configure | Configure iSCSI initiator"
+      ansible.builtin.import_role:
+        name: platform.vmware.esxi_iscsi
+      vars:
+        iscsi_targets: "{{ platform_vmware.esxi.iscsi.targets }}"
+        iscsi_vmk_adapters: "{{ platform_vmware.esxi.iscsi.vmk_adapters }}"
+      when: platform_vmware.esxi.iscsi.enabled | default(false)
+
+
+- name: "dvSwitch | Create and configure distributed virtual switch"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: "dvSwitch | Create dvSwitch on vCenter"
+      ansible.builtin.import_role:
+        name: platform.vmware.vcenter_dvswitch
+      vars:
+        vcenter_hostname:    "{{ platform_vmware.vcenter.hostname }}"
+        vcenter_username:    "{{ lookup('community.hashi_vault.hashi_vault', 'secret=' + platform_vmware.vcenter.credentials_secret + ':username') }}"
+        vcenter_password:    "{{ lookup('community.hashi_vault.hashi_vault', 'secret=' + platform_vmware.vcenter.credentials_secret + ':password') }}"
+        dvswitch_name:       "{{ platform_vmware.esxi.dvswitch.name }}"
+        dvswitch_version:    "{{ platform_vmware.esxi.dvswitch.version }}"
+        dvswitch_mtu:        "{{ platform_vmware.esxi.dvswitch.mtu }}"
+        dvswitch_uplinks:    "{{ platform_vmware.esxi.dvswitch.uplinks }}"
+        dvswitch_portgroups: "{{ platform_vmware.esxi.dvswitch.port_groups }}"
+        datacenter:          "{{ platform_vmware.vcenter.datacenter }}"
+        cluster:             "{{ platform_vmware.vcenter.cluster }}"
+
+    - name: "dvSwitch | Add all ESXi hosts to dvSwitch"
+      ansible.builtin.import_role:
+        name: platform.vmware.vcenter_dvswitch_hosts
+      vars:
+        vcenter_hostname: "{{ platform_vmware.vcenter.hostname }}"
+        dvswitch_name:    "{{ platform_vmware.esxi.dvswitch.name }}"
+        esxi_hosts:       "{{ platform_vmware.esxi.hosts }}"

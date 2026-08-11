@@ -1,0 +1,22 @@
+---
+# ansible/playbooks/hub_services/vault.yml
+# Deploy Vault HA on hub via Helm; configure OpenShift integration
+#
+# Variables consumed (from group_vars/generated/):
+#   See CLAUDE.md for the full variable reference.
+#
+# TODO: Implement using roles from the appropriate platform.* collection.
+# Pattern: import_role from the collection, pass vars from platform_* group_vars.
+# Reference: ansible/playbooks/vmware/install_esxi.yml for the calling pattern.
+
+- name: "TODO: Deploy Vault HA on hub via Helm; configure OpenShift integration"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: "Stub | Not yet implemented"
+      ansible.builtin.fail:
+        msg: >
+          This playbook is a stub and has not been implemented yet.
+          See CLAUDE.md for implementation guidance.
