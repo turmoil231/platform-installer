@@ -1,18 +1,17 @@
 """
-installer/cli.py  (collection-aware revision)
+installer/cli.py
 
-Added to the previous version:
-  - CollectionManager is initialized before any phase runs
-  - `stage-collections` command for verifying the staged tarball set
-  - `--collections-dir` option to override staged collections path
-  - `--skip-collection-install` for development
-  - Vault address auto-switching after hub_services phase
+Runs natively on the admin host as a compiled binary — no outer container.
+Ansible itself executes inside a preloaded "Ansible execution image" via
+ansible-runner's container executor (see installer/runner/ansible.py).
+Collections are baked into that image at build time; `validate` and
+`stage-collections` are build-time checks only, not part of `deploy`.
 """
 
 from __future__ import annotations
 
-import os
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import click
@@ -22,7 +21,7 @@ from rich.table import Table
 from rich import box
 
 from installer.config.loader import ConfigLoader, ConfigValidationError
-from installer.runner.ansible import AnsibleRunner, CollectionManager, CollectionInstallError
+from installer.runner.ansible import AnsibleRunner, CollectionManager
 from installer.state.store import PhaseStatus, StateStore
 from installer.phases.base import ALL_PHASES, PHASE_NAMES, Phase
 
@@ -39,6 +38,20 @@ def _load_config(config: str, manifest: str | None) -> ConfigLoader:
         sys.exit(1)
 
 
+def _ansible_dir() -> Path:
+    """
+    Locate the ansible/ directory (playbooks/, collections/requirements.yml).
+    When compiled with PyInstaller (--add-data "ansible:ansible", see
+    packaging/build_binary.sh), it's bundled into the executable and
+    extracted at runtime under sys._MEIPASS — Path(__file__) instead
+    resolves into that same temp extraction dir, not the real repo, so it
+    can't be used to find sibling data directories in a frozen binary.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "ansible"  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parents[1] / "ansible"
+
+
 def _resolve_collections_dir(loader: ConfigLoader, override: str | None) -> Path:
     if override:
         return Path(override).resolve()
@@ -46,76 +59,68 @@ def _resolve_collections_dir(loader: ConfigLoader, override: str | None) -> Path
     return Path(staging_root) / "collections"
 
 
-def _setup_collection_manager(
-    loader: ConfigLoader, state_dir: Path, collections_dir: Path,
-    lock_file: str, skip_install: bool, dry_run: bool,
-) -> CollectionManager:
-    ansible_dir  = Path(__file__).resolve().parents[1] / "ansible"
-    requirements = ansible_dir / "collections" / "requirements.yml"
-    install_dir  = state_dir / "collections"
+def _default_ansible_image() -> str:
+    try:
+        v = version("platform-installer")
+    except PackageNotFoundError:
+        v = "dev"
+    return f"platform-ansible-exec:{v}"
 
-    manager = CollectionManager(
-        staged_collections_dir = collections_dir,
-        install_dir            = install_dir,
-        requirements_file      = requirements,
-        lock_file              = lock_file if Path(lock_file).exists() else None,
-        verify_checksums       = not dry_run,
-    )
 
-    if not skip_install:
-        console.rule("[bold]Collection Setup[/bold]")
-        errors = manager.validate_staged_assets()
-        if errors:
-            console.print("[bold red]Collection staging validation failed:[/bold red]")
-            for err in errors:
-                console.print(f"  [red]• {err}[/red]")
-            console.print(
-                "\nRun [bold]scripts/stage_collections.sh[/bold] in a connected "
-                "environment, then transfer tarballs to this host."
-            )
-            sys.exit(1)
-        try:
-            manager.install()
-        except CollectionInstallError as exc:
-            console.print(f"[bold red]Collection install failed:[/bold red] {exc}")
-            sys.exit(1)
-
-    return manager
+def _build_host_mounts(loader: ConfigLoader) -> list[tuple[Path, bool]]:
+    """
+    External, user-provided paths that must be visible inside the Ansible
+    execution container but live outside private_data_dir (see the
+    AnsibleRunner docstring for why these are mounted rather than copied).
+    """
+    g = loader.config.global_  # type: ignore[union-attr]
+    mounts: list[tuple[Path, bool]] = [
+        (Path(g.ssh.public_key_path),       True),
+        (Path(g.ssh.private_key_path),      True),
+        (Path(g.tls.internal_ca_cert_path), True),
+        (Path(g.tls.internal_ca_key_path),  True),
+        (Path(g.pull_secret_path),          True),
+    ]
+    staging_root = loader._raw_config.get("assets", {}).get("staging_root")
+    if staging_root:
+        mounts.append((Path(staging_root), True))
+    return mounts
 
 
 def _make_runner(
-    loader: ConfigLoader, state_dir: Path, collections_install_dir: Path, dry_run: bool,
+    loader:            ConfigLoader,
+    state_dir:         Path,
+    container_image:   str,
+    container_runtime: str | None,
+    dry_run:           bool,
 ) -> AnsibleRunner:
-    ansible_dir   = Path(__file__).resolve().parents[1] / "ansible"
-    artifacts_dir = state_dir / "ansible-artifacts"
-    vars_dir      = state_dir / "ansible-vars"
-    inventory     = state_dir / "inventory.yml"
+    ansible_dir      = _ansible_dir()
+    private_data_dir = state_dir / "ansible-pdd"
 
-    loader.generate_ansible_vars(vars_dir)
-    loader.generate_ansible_inventory(inventory)
+    loader.generate_ansible_vars(private_data_dir / "vars")
+    loader.generate_ansible_inventory(private_data_dir / "inventory" / "hosts.yml")
 
-    extra_vars_files = sorted(vars_dir.glob("**/*.yml"))
-    automation  = loader.config.global_.automation  # type: ignore[union-attr]
-    secrets     = loader._raw_config.get("secrets", {}).get("vault", {})
-    vault_addr  = secrets.get("bootstrap_addr", "http://localhost:8200")
+    automation = loader.config.global_.automation  # type: ignore[union-attr]
+    secrets    = loader._raw_config.get("secrets", {}).get("vault", {})
+    vault_addr = secrets.get("bootstrap_addr", "http://localhost:8200")
 
     return AnsibleRunner(
-        ansible_dir             = ansible_dir,
-        collections_install_dir = collections_install_dir,
-        artifacts_dir           = artifacts_dir,
-        extra_vars_files        = extra_vars_files,
-        inventory_path          = inventory,
-        vault_addr              = vault_addr,
-        vault_role_id_env       = secrets.get("role_id_env",   "VAULT_ROLE_ID"),
-        vault_secret_id_env     = secrets.get("secret_id_env", "VAULT_SECRET_ID"),
-        max_retries             = automation.max_retries,
-        retry_delay             = automation.retry_delay_seconds,
-        dry_run                 = dry_run,
+        ansible_dir          = ansible_dir,
+        private_data_dir     = private_data_dir,
+        container_image      = container_image,
+        container_runtime    = container_runtime,
+        host_mounts          = _build_host_mounts(loader),
+        vault_addr           = vault_addr,
+        vault_role_id_env    = secrets.get("role_id_env",   "VAULT_ROLE_ID"),
+        vault_secret_id_env  = secrets.get("secret_id_env", "VAULT_SECRET_ID"),
+        max_retries          = automation.max_retries,
+        retry_delay          = automation.retry_delay_seconds,
+        dry_run              = dry_run,
     )
 
 
 def _instantiate_phases(runner: AnsibleRunner, store: StateStore, loader: ConfigLoader) -> list[Phase]:
-    vars_dir = runner.artifacts_dir.parent / "ansible-vars"
+    vars_dir = runner.private_data_dir / "vars"
     merged: dict = {}
     for f in sorted(vars_dir.glob("**/*.yml")):
         with f.open() as fh:
@@ -169,11 +174,10 @@ def validate(config, manifest, collections_dir, collections_lock):
         f"version {loader.manifest.get('manifest_version')} matches"
     )
     coll_dir     = _resolve_collections_dir(loader, collections_dir)
-    ansible_dir  = Path(__file__).resolve().parents[1] / "ansible"
+    ansible_dir  = _ansible_dir()
     requirements = ansible_dir / "collections" / "requirements.yml"
     manager = CollectionManager(
         staged_collections_dir = coll_dir,
-        install_dir            = Path("/tmp/platform-validate-collections"),
         requirements_file      = requirements,
         lock_file              = collections_lock if Path(collections_lock).exists() else None,
         verify_checksums       = True,
@@ -236,7 +240,7 @@ def stage_collections(config, collections_dir, collections_lock):
     """
     loader   = _load_config(config, None)
     coll_dir = _resolve_collections_dir(loader, collections_dir)
-    ansible_dir  = Path(__file__).resolve().parents[1] / "ansible"
+    ansible_dir  = _ansible_dir()
     requirements = ansible_dir / "collections" / "requirements.yml"
 
     console.rule("[bold]Collection Staging Verification[/bold]")
@@ -246,7 +250,6 @@ def stage_collections(config, collections_dir, collections_lock):
 
     manager = CollectionManager(
         staged_collections_dir = coll_dir,
-        install_dir            = Path("/tmp/platform-stage-check"),
         requirements_file      = requirements,
         lock_file              = collections_lock if Path(collections_lock).exists() else None,
         verify_checksums       = True,
@@ -282,22 +285,21 @@ def stage_collections(config, collections_dir, collections_lock):
 @click.option("--config",                   "-c", default="platform-config.yaml")
 @click.option("--manifest",                 "-m", default=None)
 @click.option("--state-dir",                      default=".platform-installer-state")
-@click.option("--collections-dir",                default=None)
-@click.option("--collections-lock",               default="collections.lock.yml")
+@click.option("--ansible-image",                  default=None,
+              help="Tag of the preloaded Ansible execution image "
+                   "(default: platform-ansible-exec:<installer version>).")
+@click.option("--container-runtime",              default=None,
+              help="podman or docker. Auto-detected (podman preferred) if not set.")
 @click.option("--phase",                    "-p", default=None)
 @click.option("--from-phase",                     default=None)
 @click.option("--to-phase",                       default=None)
 @click.option("--dry-run",                        is_flag=True, default=False)
 @click.option("--skip-health-checks",             is_flag=True, default=False)
 @click.option("--auto-approve",                   is_flag=True, default=False)
-@click.option("--skip-collection-install",        is_flag=True, default=False,
-              help="Skip collection install (already installed in state dir).")
-@click.option("--reinstall-collections",          is_flag=True, default=False,
-              help="Force re-install even if collections already installed.")
 def deploy(
-    config, manifest, state_dir, collections_dir, collections_lock,
+    config, manifest, state_dir, ansible_image, container_runtime,
     phase, from_phase, to_phase, dry_run, skip_health_checks,
-    auto_approve, skip_collection_install, reinstall_collections,
+    auto_approve,
 ):
     """Run the full deployment or a subset of phases."""
     console.rule("[bold blue]Platform Installer[/bold blue]")
@@ -309,21 +311,11 @@ def deploy(
     store = StateStore(state_path / "state.db")
     store.initialize(PHASE_NAMES)
 
-    # Collection setup — must happen before any Ansible execution
-    coll_staged = _resolve_collections_dir(loader, collections_dir)
-    manager = _setup_collection_manager(
-        loader=loader, state_dir=state_path, collections_dir=coll_staged,
-        lock_file=collections_lock, skip_install=skip_collection_install, dry_run=dry_run,
-    )
-    if reinstall_collections:
-        marker = state_path / "collections" / ".install_complete"
-        if marker.exists():
-            marker.unlink()
-        manager.install(force=True)
-
     runner = _make_runner(
         loader=loader, state_dir=state_path,
-        collections_install_dir=state_path / "collections", dry_run=dry_run,
+        container_image=ansible_image or _default_ansible_image(),
+        container_runtime=container_runtime,
+        dry_run=dry_run,
     )
     phases        = _instantiate_phases(runner, store, loader)
     phase_by_name = {p.name: p for p in phases}
@@ -404,22 +396,21 @@ def deploy(
 # ── preflight (alias) ──────────────────────────────────────────────────────────
 
 @main.command()
-@click.option("--config",          "-c", default="platform-config.yaml")
-@click.option("--manifest",        "-m", default=None)
-@click.option("--state-dir",             default=".platform-installer-state")
-@click.option("--collections-dir",       default=None)
-@click.option("--collections-lock",      default="collections.lock.yml")
-@click.option("--dry-run",               is_flag=True, default=False)
-def preflight(config, manifest, state_dir, collections_dir, collections_lock, dry_run):
+@click.option("--config",             "-c", default="platform-config.yaml")
+@click.option("--manifest",           "-m", default=None)
+@click.option("--state-dir",                default=".platform-installer-state")
+@click.option("--ansible-image",            default=None)
+@click.option("--container-runtime",        default=None)
+@click.option("--dry-run",                  is_flag=True, default=False)
+def preflight(config, manifest, state_dir, ansible_image, container_runtime, dry_run):
     """Run preflight checks only."""
     ctx = click.get_current_context()
     ctx.invoke(
         deploy,
         config=config, manifest=manifest, state_dir=state_dir,
-        collections_dir=collections_dir, collections_lock=collections_lock,
+        ansible_image=ansible_image, container_runtime=container_runtime,
         phase="preflight", dry_run=dry_run, skip_health_checks=False,
-        auto_approve=True, skip_collection_install=False,
-        reinstall_collections=False, from_phase=None, to_phase=None,
+        auto_approve=True, from_phase=None, to_phase=None,
     )
 
 
@@ -443,3 +434,7 @@ def report(config, state_dir):
         for ev in store.events_for(rec.name):
             colour = {"error": "red", "warn": "yellow"}.get(ev["level"], "dim")
             console.print(f"  [{colour}]{ev['ts']} [{ev['level']}] {ev['message']}[/{colour}]")
+
+
+if __name__ == "__main__":
+    main()

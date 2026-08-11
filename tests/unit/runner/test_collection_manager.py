@@ -1,7 +1,9 @@
 """
 tests/unit/runner/test_collection_manager.py
 
-Unit tests for CollectionManager.
+Unit tests for CollectionManager. This is a build-time validator only —
+collections are baked into the Ansible execution image at build time, not
+installed at deploy time — see installer/runner/ansible.py.
 
 TODO: Implement tests for:
   - validate_staged_assets() returns empty list when all tarballs present
@@ -10,10 +12,6 @@ TODO: Implement tests for:
   - _find_tarball() finds exact version match
   - _find_tarball() falls back to glob when exact version not found
   - _find_tarball() returns None when no tarball exists
-  - install() runs ansible-galaxy for each tarball (mock subprocess)
-  - install() writes .install_complete marker
-  - install() skips if marker exists and force=False
-  - install() re-installs if force=True
 """
 import pytest
 import tempfile

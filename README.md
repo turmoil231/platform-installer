@@ -18,9 +18,9 @@ Disconnected, bare-metal-to-OpenShift platform deployment tool.
 │  │   ├── Tracks phase completion across runs                    │
 │  │   └── Enables resume-from-failure                           │
 │  │                                                              │
-│  ├── Runner Layer (ansible-runner)                              │
-│  │   ├── Executes playbooks with streaming output               │
-│  │   ├── Injects generated vars as extra-vars                   │
+│  ├── Runner Layer (ansible-runner, container executor)          │
+│  │   ├── Launches the Ansible execution image per playbook      │
+│  │   ├── Injects generated vars/inventory via private_data_dir  │
 │  │   └── Handles retry logic                                    │
 │  │                                                              │
 │  └── Phase Layer                                                │
@@ -29,13 +29,17 @@ Disconnected, bare-metal-to-OpenShift platform deployment tool.
 │      └── → spoke_clusters → vdi_services → validation           │
 │                          │                                      │
 │                          ▼                                      │
-│  ansible/                                                       │
-│  ├── playbooks/          ← One per phase / sub-task             │
-│  ├── roles/              ← Reusable role library                │
-│  ├── inventory/generated/ ← Written by installer                │
-│  └── group_vars/generated/ ← Written by installer               │
+│  <state-dir>/ansible-pdd/  (ansible-runner private_data_dir)    │
+│  ├── project/    ← synced copy of ansible/ (playbooks/, ...)    │
+│  ├── vars/       ← generated group_vars-equivalent extra-vars   │
+│  └── inventory/  ← generated static inventory                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+Ansible itself never runs on the admin host — every playbook executes inside
+a preloaded "Ansible execution image" (ansible-core + all collections baked
+in at build time), launched via `ansible-runner`'s container executor. See
+`installer/runner/ansible.py` and `packaging/Containerfile.ansible-exec`.
 
 ## Installation
 

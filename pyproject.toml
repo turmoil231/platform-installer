@@ -26,6 +26,9 @@ dev = [
     "pytest-mock>=3.12",
     "pytest-cov>=4.1",
 ]
+build = [
+    "pyinstaller>=6.0",
+]
 
 [project.scripts]
 platform-installer = "installer.cli:main"

@@ -8,8 +8,13 @@ and `platform-manifest.yaml`, validates them, generates Ansible inventory and
 group_vars, then executes a series of phases by calling Ansible playbooks
 through ansible-runner.
 
-The installer runs inside a container image (podman/docker). A host wrapper
-script (`platform-installer`) handles volume mounts and auto-loads the image.
+The installer itself is a PyInstaller-compiled single binary that runs
+**natively** on the admin host — no container, no venv to activate. Ansible
+never runs on the host: every playbook executes inside a separate, preloaded
+"Ansible execution image" (ansible-core + all collections baked in at build
+time), launched per playbook run via ansible-runner's container/
+process-isolation executor (`process_isolation=True`). See
+`installer/runner/ansible.py` and `packaging/Containerfile.ansible-exec`.
 
 ## Architecture decisions already made — do not relitigate these
 
@@ -20,40 +25,49 @@ script (`platform-installer`) handles volume mounts and auto-loads the image.
 - **SQLite state store** (`installer/state/store.py`) tracks phase completion.
   Enables resume-from-failure. Never re-run a completed phase.
 - **ansible-runner** (not subprocess) for Ansible execution. Streaming output
-  via event_handler. See `installer/runner/ansible.py`.
-- **CollectionManager** installs Ansible collections from pre-staged tarballs
-  at startup. Sets `ANSIBLE_COLLECTIONS_PATH`. No Galaxy calls at deploy time.
+  via event_handler. Configured for containerized execution
+  (`process_isolation=True`, `container_image=...`) — it shells out to
+  `podman/docker run <ansible-exec-image> ansible-playbook ...` per playbook.
+  See `installer/runner/ansible.py`.
+- **CollectionManager** is a build-time validator only. It checks staged
+  collection tarballs against `collections.lock.yml` checksums before they're
+  baked into the Ansible execution image
+  (`packaging/build_ansible_image.sh`). It does not install anything at
+  deploy time — collections live inside that image exclusively, never on the
+  admin host.
 - **Two-file config model**: `platform-config.yaml` (topology/intent) +
   `platform-manifest.yaml` (all version pins and checksums).
-- **Container distribution**: image tarball + small wrapper tarball. The
-  wrapper script auto-loads the image if not present. No separate load step.
+- **Distribution**: a compiled single binary (`platform-installer-<version>`,
+  built by `packaging/build_binary.sh`) + a preloaded Ansible execution image
+  tarball (built by `packaging/build_ansible_image.sh`), transferred together.
+  The binary auto-loads the image into the local podman/docker store on
+  first run if it isn't already present (`AnsibleRunner.ensure_ready()`) —
+  no separate load step, no wrapper script.
 
 ## Project structure
 
 ```
 platform-installer/
-├── platform-installer          # Host wrapper script (@@VERSION@@ placeholder)
 ├── installer/
-│   ├── cli.py                  # Click CLI — all commands
+│   ├── cli.py                  # Click CLI — all commands (PyInstaller entry point)
 │   ├── config/
 │   │   ├── loader.py           # YAML load, manifest validation, var generation
 │   │   └── models.py           # Pydantic v2 models for full config schema
 │   ├── phases/
 │   │   └── base.py             # Phase base class + all phase implementations
 │   ├── runner/
-│   │   └── ansible.py          # AnsibleRunner + CollectionManager
+│   │   └── ansible.py          # AnsibleRunner (container executor) + CollectionManager
 │   └── state/
 │       └── store.py            # SQLite phase state store
 ├── ansible/
 │   ├── playbooks/              # Thin orchestration playbooks (call collection roles)
-│   ├── collections/
-│   │   └── requirements.yml    # Collection dependency declarations
-│   ├── inventory/generated/    # Written at runtime — do not edit
-│   └── group_vars/generated/   # Written at runtime — do not edit
+│   └── collections/
+│       └── requirements.yml    # Collection dependency declarations
 ├── packaging/
-│   ├── Containerfile           # Container image build
-│   ├── build_image.sh          # Builds image + wrapper tarballs
-│   └── seed_pip_cache.sh       # Pre-downloads pip wheels for offline builds
+│   ├── Containerfile.ansible-exec  # Ansible execution image build (ansible-core + collections)
+│   ├── build_ansible_image.sh      # Builds + saves the Ansible execution image
+│   ├── build_binary.sh             # PyInstaller build of the compiled CLI binary
+│   └── seed_pip_cache.sh           # Pre-downloads pip wheels for offline builds
 ├── scripts/
 │   └── stage_collections.sh   # Fetches collection tarballs from GitLab
 ├── vault-policies/             # Vault HCL policies seeded during bootstrap
@@ -61,6 +75,12 @@ platform-installer/
 ├── platform-config.yaml.example
 └── platform-manifest.yaml.example
 ```
+
+At runtime, ansible-runner's `private_data_dir` (`<state-dir>/ansible-pdd/`)
+holds a synced copy of `ansible/` (`project/`), generated extra-vars
+(`vars/`), and generated inventory (`inventory/`) — this whole directory is
+bind-mounted into the Ansible execution container on every playbook run.
+Nothing is written under the `ansible/` source tree at runtime anymore.
 
 ## Deployment phases (in order)
 
@@ -93,7 +113,9 @@ platform-installer/
 
 All collections come from the platform.ocp and other platform.* collections
 in separate GitLab repos. Declared in `ansible/collections/requirements.yml`.
-Staged as tarballs, installed into state dir at deploy time by CollectionManager.
+Staged as tarballs (`scripts/stage_collections.sh`), then baked into the
+Ansible execution image at build time (`packaging/build_ansible_image.sh`).
+Never installed on the admin host, at build time or deploy time.
 
 Required collections:
 - platform.ocp (OCP install, post-install, validation)
@@ -117,10 +139,12 @@ Required collections:
 
 ## Environment assumptions
 
-- Admin server: RHEL 9, Python 3.11+, podman installed
+- Admin server: RHEL 9, podman installed (docker fallback) — no Python
+  required; the installer is a compiled binary
 - All deployments: fully disconnected (no internet access at deploy time)
 - Secrets: HashiCorp Vault (AppRole auth), VAULT_ROLE_ID + VAULT_SECRET_ID env vars
-- Container runtime: podman preferred, docker fallback
+- Container runtime: podman preferred, docker fallback (used to launch the
+  Ansible execution image — the installer binary itself never runs containerized)
 - All OCP clusters: RHEL 9 gold images, OCP 4.16
 - Storage: Pure FlashArray (iSCSI) + Pure FlashBlade (NFS/S3)
 - Identity: Red Hat IDM (LDAP + DNS + CA)
@@ -130,6 +154,9 @@ Required collections:
 - Add internet-calling code — everything must work air-gapped
 - Use subprocess for Ansible — use ansible-runner only
 - Put secrets in var files — always vault lookup at task time
-- Call ansible-galaxy at deploy time — collections are pre-staged
+- Call ansible-galaxy at deploy time — collections are pre-staged and baked
+  into the Ansible execution image at build time. This is structurally
+  enforced now: collections aren't even reachable from the admin host
+  process, only from inside the execution image.
 - Use `set_fact` to pass data between separate playbook runs —
   use the discovered_vars.yml file pattern (see platform.ocp collection)

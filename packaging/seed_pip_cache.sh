@@ -4,16 +4,15 @@
 # Run this ONCE on a connected build host to download all Python packages
 # into packaging/pip-cache/ as wheel files.
 #
-# build_bundle.sh then uses `pip install --no-index --find-links pip-cache/`
-# to build the venv without any network access.  This means the build itself
-# is also disconnected-safe after this cache is seeded.
+# build_binary.sh then uses `pip install --no-index --find-links pip-cache/`
+# to build the PyInstaller venv without any network access. This means the
+# build itself is also disconnected-safe after this cache is seeded.
 #
 # Usage:
 #   ./packaging/seed_pip_cache.sh
 #   ./packaging/seed_pip_cache.sh --python /usr/bin/python3.11 --extra-index-url <url>
 #
 # The pip-cache/ directory should be committed to git (or stored in Artifactory).
-# It is excluded from the final bundle tarball (only the venv built from it ships).
 
 set -euo pipefail
 
@@ -45,6 +44,15 @@ EXTRA_ARGS=()
 # --no-deps on the installer itself first so we get exactly what pyproject.toml declares
 # then download all transitive deps
 
+# build-system.requires (pyproject.toml [build-system]) — pip needs these to
+# build the local sdist even when installing everything else with --no-index.
+echo "==> Downloading PEP 517 build backend deps ..."
+${PYTHON_BIN} -m pip download \
+  --dest "${CACHE_DIR}" \
+  --prefer-binary \
+  "${EXTRA_ARGS[@]}" \
+  "setuptools>=68" wheel
+
 echo "==> Downloading installer package and all dependencies ..."
 ${PYTHON_BIN} -m pip download \
   --dest "${CACHE_DIR}" \
@@ -59,9 +67,18 @@ ${PYTHON_BIN} -m pip download \
   --prefer-binary \
   pytest pytest-mock
 
+# Build-only dependencies (PyInstaller) — needed by build_binary.sh, not
+# shipped in the compiled binary itself.
+echo "==> Downloading build dependencies ..."
+${PYTHON_BIN} -m pip download \
+  --dest "${CACHE_DIR}" \
+  --prefer-binary \
+  "${EXTRA_ARGS[@]}" \
+  "${REPO_ROOT}[build]"
+
 echo ""
 echo "==> Pip cache seeded: $(ls "${CACHE_DIR}" | wc -l) packages"
 echo "    Location: ${CACHE_DIR}"
 echo ""
 echo "  Commit pip-cache/ to git or upload to Artifactory."
-echo "  build_bundle.sh will use it with --no-index --find-links."
+echo "  build_binary.sh will use it with --no-index --find-links."

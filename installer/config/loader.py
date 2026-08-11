@@ -174,7 +174,6 @@ class ConfigLoader:
                 "server_cpu_sockets":          server.get("cpu_sockets", 1),
                 "server_cpu_cores_per_socket": server.get("cpu_cores_per_socket", 0),
             }
-            inventory["all"]["children"]["all"] = {}  # placeholder
 
             if server_name in esxi_server_names:
                 inventory["all"]["children"]["esxi_hosts"]["hosts"][server_name] = host_vars

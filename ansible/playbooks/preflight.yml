@@ -17,6 +17,12 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  # These checks are all read-only (stat/uri/assert) and never need root.
+  # The Ansible execution container runs as an arbitrary, non-root host UID
+  # with no /etc/passwd entry, so `become` (inherited from ansible.cfg's
+  # global default, meant for remote managed hosts over SSH) would fail
+  # here with "sudo: you do not exist in the passwd database".
+  become: false
 
   tasks:
 

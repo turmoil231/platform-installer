@@ -5,8 +5,9 @@
 #
 # Pipeline stages:
 #   test        → unit + integration tests against the installer Python package
-#   build       → assemble the distribution tarball + container image
-#   publish     → push tarball to Artifactory, image to internal registry
+#   build       → compile the single-file binary (PyInstaller) + build the
+#                 preloaded Ansible execution image (ansible-core + collections)
+#   publish     → push the binary to Artifactory, the image to internal registry
 #
 # Required GitLab CI/CD variables (set in project Settings → CI/CD → Variables):
 #   ARTIFACTORY_URL         https://artifactory.apps.hub.example.internal
@@ -60,7 +61,6 @@ config-validation:
     - pip install --quiet -e . --find-links packaging/pip-cache || true
     - platform-installer validate
         --config platform-config.yaml.example
-        --skip-collection-install
   allow_failure: false
 
 schema-lint:
@@ -72,7 +72,6 @@ schema-lint:
     - python3 -c "
         from installer.config.loader import ConfigLoader
         import yaml
-        # Ensure Pydantic models import cleanly
         from installer.config.models import PlatformConfig
         print('Schema models OK')
       "
@@ -80,7 +79,7 @@ schema-lint:
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
-build-bundle:
+build-binary:
   stage: build
   needs: [unit-tests, config-validation]
   script:
@@ -91,41 +90,31 @@ build-bundle:
         ./packaging/seed_pip_cache.sh
       fi
 
-    # Stage collections from internal GitLab collection repos
-    - ./scripts/stage_collections.sh
-        --staging-root .build
-        --requirements ansible/collections/requirements.yml
-        --lock-file collections.lock.yml
+    # Compile the single-file binary (no collections needed for this — they
+    # only matter for the Ansible execution image, built separately below)
+    - ./packaging/build_binary.sh --skip-tests
 
-    # Build the distribution tarball
-    - ./packaging/build_bundle.sh
-        --skip-tests
-        --skip-collections
-
-    # Verify the tarball can be extracted and the wrapper runs
+    # Smoke test — the binary is directly executable, no extraction/wrapper needed
     - |
       VERSION="$(grep '^version' pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')"
-      EXTRACT_DIR="$(mktemp -d)"
-      tar -xzf "dist/platform-installer-${VERSION}.tar.gz" -C "${EXTRACT_DIR}"
-      "${EXTRACT_DIR}/platform-installer-${VERSION}/platform-installer" --help
-      echo "Bundle smoke test: PASSED"
+      "dist/platform-installer-${VERSION}" --help
+      echo "Binary smoke test: PASSED"
 
   artifacts:
     paths:
-      - dist/
-      - collections.lock.yml
+      - dist/platform-installer-*
     expire_in: 30 days
 
 
-build-container:
+build-ansible-image:
   stage: build
   needs: [unit-tests]
   image: registry.example.internal:5000/platform/podman-builder:latest
   script:
     - |
       VERSION="$(grep '^version' pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')"
-      IMAGE_TAG="${REGISTRY_URL}/platform/platform-installer:${VERSION}"
-      IMAGE_TAG_LATEST="${REGISTRY_URL}/platform/platform-installer:latest"
+      IMAGE_TAG="${REGISTRY_URL}/platform/platform-ansible-exec:${VERSION}"
+      IMAGE_TAG_LATEST="${REGISTRY_URL}/platform/platform-ansible-exec:latest"
 
       # Stage collections so they can be baked into the image
       ./scripts/stage_collections.sh \
@@ -134,46 +123,48 @@ build-container:
 
       # Build the image
       podman build \
-        --file packaging/Containerfile \
+        --file packaging/Containerfile.ansible-exec \
         --tag "${IMAGE_TAG}" \
         --tag "${IMAGE_TAG_LATEST}" \
         --build-arg VERSION="${VERSION}" \
         .
 
-      # Smoke test the image
-      podman run --rm "${IMAGE_TAG}" --help
-      echo "Container smoke test: PASSED"
+      # Smoke test — no CLI inside this image, verify ansible-core + collections
+      podman run --rm "${IMAGE_TAG}" ansible-playbook --version
+      podman run --rm "${IMAGE_TAG}" \
+        ansible-galaxy collection list --collections-path /opt/ansible/collections
+      echo "Ansible execution image smoke test: PASSED"
 
       # Save as tarball for air-gap transfer artifact
       mkdir -p dist
       podman save "${IMAGE_TAG}" \
-        | gzip > "dist/platform-installer-${VERSION}-container.tar.gz"
+        | gzip > "dist/platform-ansible-exec-${VERSION}-container.tar.gz"
 
   artifacts:
     paths:
-      - dist/platform-installer-*-container.tar.gz
+      - dist/platform-ansible-exec-*-container.tar.gz
     expire_in: 30 days
 
 
 # ── Publish ───────────────────────────────────────────────────────────────────
 
-publish-bundle-to-artifactory:
+publish-binary-to-artifactory:
   stage: publish
-  needs: [build-bundle]
+  needs: [build-binary]
   only:
     - tags                                    # Only publish on tagged releases
     - main
   script:
     - |
       VERSION="$(grep '^version' pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')"
-      TARBALL="dist/platform-installer-${VERSION}.tar.gz"
-      CHECKSUM="dist/platform-installer-${VERSION}.tar.gz.sha256"
+      BINARY="dist/platform-installer-${VERSION}"
+      CHECKSUM="dist/platform-installer-${VERSION}.sha256"
       REPO_PATH="${ARTIFACTORY_URL}/artifactory/platform-releases/platform-installer/${VERSION}/"
 
-      echo "Publishing ${TARBALL} to Artifactory ..."
+      echo "Publishing ${BINARY} to Artifactory ..."
       curl --silent --show-error --fail \
         --user "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" \
-        --upload-file "${TARBALL}" \
+        --upload-file "${BINARY}" \
         "${REPO_PATH}"
 
       curl --silent --show-error --fail \
@@ -184,9 +175,9 @@ publish-bundle-to-artifactory:
       echo "Published: ${REPO_PATH}"
 
 
-publish-container-to-registry:
+publish-ansible-image-to-registry:
   stage: publish
-  needs: [build-container]
+  needs: [build-ansible-image]
   only:
     - tags
     - main
@@ -194,9 +185,9 @@ publish-container-to-registry:
   script:
     - |
       VERSION="$(grep '^version' pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')"
-      CONTAINER_TAR="dist/platform-installer-${VERSION}-container.tar.gz"
-      IMAGE_TAG="${REGISTRY_URL}/platform/platform-installer:${VERSION}"
-      IMAGE_TAG_LATEST="${REGISTRY_URL}/platform/platform-installer:latest"
+      CONTAINER_TAR="dist/platform-ansible-exec-${VERSION}-container.tar.gz"
+      IMAGE_TAG="${REGISTRY_URL}/platform/platform-ansible-exec:${VERSION}"
+      IMAGE_TAG_LATEST="${REGISTRY_URL}/platform/platform-ansible-exec:latest"
 
       podman load < "${CONTAINER_TAR}"
       podman login "${REGISTRY_URL}" \

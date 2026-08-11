@@ -1,0 +1,125 @@
+# packaging/Containerfile.ansible-exec
+#
+# Builds the Ansible execution image used by platform-installer's
+# containerized Ansible execution (see installer/runner/ansible.py).
+# ansible-runner shells out to `podman/docker run <image> ansible-playbook ...`
+# per playbook run — this image supplies ansible-core plus every collection
+# required by the thin orchestration playbooks in ansible/playbooks/,
+# preloaded at build time. No internet access needed at deploy time.
+#
+# The compiled platform-installer CLI never runs inside this image — it runs
+# natively on the admin host and only launches this image, once per playbook,
+# to execute ansible-playbook.
+#
+# Build:
+#   ./packaging/build_ansible_image.sh
+#
+# The resulting image is saved as:
+#   dist/platform-ansible-exec-<VERSION>-container.tar.gz
+
+ARG RHEL_VERSION=9.4
+FROM registry.access.redhat.com/ubi9/ubi:${RHEL_VERSION}
+
+ARG VERSION=dev
+ARG BUILD_DATE
+ARG GIT_COMMIT
+
+LABEL name="platform-ansible-exec"                                  \
+      version="${VERSION}"                                          \
+      build-date="${BUILD_DATE}"                                    \
+      git-commit="${GIT_COMMIT}"                                    \
+      description="Preloaded Ansible execution image for platform-installer" \
+      maintainer="platform-ops@example.internal"
+
+# ── System packages ───────────────────────────────────────────────────────────
+# openssh-clients  : ssh binary used by ansible for remote connections
+# git              : used internally by some collection roles
+# rsync            : used by some synchronization roles
+# jq               : useful in playbook shell tasks
+# krb5-workstation : Kerberos client (for IDM-joined host playbooks)
+# sudo             : ansible.cfg sets `become = True` globally, which also
+#                    applies to `connection: local` tasks (e.g.
+#                    preflight.yml) — those escalate privileges inside this
+#                    container itself, not on a remote managed host.
+#
+# ansible-core is NOT in UBI9's unsubscribed BaseOS/AppStream/CodeReady repos
+# (dnf install ansible-core fails with "No match for argument" without a
+# registered Red Hat subscription) — installed via pip below instead.
+RUN dnf install -y \
+      python3.11        \
+      python3.11-pip    \
+      openssh-clients   \
+      git               \
+      rsync             \
+      jq                \
+      krb5-workstation  \
+      sudo              \
+    && dnf clean all    \
+    && rm -rf /var/cache/dnf
+
+RUN python3.11 -m pip install --no-cache-dir ansible-core \
+    && ansible-playbook --version
+
+# ── Ansible collections ───────────────────────────────────────────────────────
+# Collection tarballs are staged by build_ansible_image.sh (via
+# scripts/stage_collections.sh) before the build context is handed to
+# podman/docker. Installed here; source tarballs are removed after — the
+# installed collection tree is what this image ships.
+COPY ansible/collections/requirements.yml /opt/ansible/collections/requirements.yml
+COPY collections/                          /tmp/staged-collections/
+COPY collections.lock.yml                  /opt/ansible/collections.lock.yml
+
+RUN echo "Installing Ansible collections from staged tarballs ..." \
+    && find /tmp/staged-collections -name "*.tar.gz" | sort        \
+       | xargs -I{} ansible-galaxy collection install {}            \
+           --collections-path /opt/ansible/collections              \
+           --force                                                  \
+    && echo "Installed collections:"                                \
+    && ansible-galaxy collection list                               \
+           --collections-path /opt/ansible/collections               \
+    && rm -rf /tmp/staged-collections
+
+# ── ansible.cfg (baked in) ─────────────────────────────────────────────────────
+RUN cat > /opt/ansible/ansible.cfg << 'CFG'
+[defaults]
+collections_paths      = /opt/ansible/collections
+host_key_checking      = False
+retry_files_enabled    = False
+stdout_callback        = default
+callbacks_enabled      = timer, profile_tasks
+timeout                = 30
+forks                  = 20
+gathering               = smart
+fact_caching             = jsonfile
+fact_caching_connection  = /tmp/ansible_facts_cache
+fact_caching_timeout     = 7200
+
+[privilege_escalation]
+become        = True
+become_method = sudo
+become_user   = root
+
+[ssh_connection]
+ssh_args   = -o ControlMaster=auto -o ControlPersist=60s -o StrictHostKeyChecking=no
+pipelining = True
+retries    = 5
+
+[galaxy]
+server_list =
+# Empty — no Galaxy servers. All collection content is baked into this image.
+CFG
+
+ENV ANSIBLE_CONFIG="/opt/ansible/ansible.cfg" \
+    ANSIBLE_COLLECTIONS_PATH="/opt/ansible/collections"
+
+# ── Build metadata ────────────────────────────────────────────────────────────
+RUN echo "version=${VERSION}"       > /opt/ansible/BUILD.txt  \
+ && echo "build-date=${BUILD_DATE}" >> /opt/ansible/BUILD.txt  \
+ && echo "git-commit=${GIT_COMMIT}" >> /opt/ansible/BUILD.txt
+
+# ── No ENTRYPOINT / CMD ────────────────────────────────────────────────────────
+# ansible-runner's container executor (process_isolation=True) invokes this
+# image directly as:
+#   <runtime> run --rm --workdir /runner/project ... <image> ansible-playbook -i ... playbook.yml ...
+# An ENTRYPOINT here would swallow that argv. Leave it unset so
+# ansible-playbook (installed above, on PATH) runs as the container command.
