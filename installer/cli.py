@@ -27,6 +27,13 @@ from installer.phases.base import ALL_PHASES, PHASE_NAMES, Phase
 
 console = Console()
 
+# The platform release this installer build is intended to deploy — distinct
+# from the installer's own version (below) and from any particular
+# operator-provided platform-manifest.yaml's manifest_version, which just
+# pins that one environment's component versions. Bump this when cutting an
+# installer release against a new platform-manifest.yaml.example baseline.
+PLATFORM_VERSION = "2025.1.0"
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -152,7 +159,24 @@ def _print_phase_table(store: StateStore) -> None:
 
 # ── CLI group ──────────────────────────────────────────────────────────────────
 
+def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+    try:
+        installer_version = version("platform-installer")
+    except PackageNotFoundError:
+        installer_version = "dev"
+    console.print(f"platform-installer version: {installer_version}")
+    console.print(f"platform version:           {PLATFORM_VERSION}")
+    ctx.exit()
+
+
 @click.group()
+@click.option(
+    "--version", is_flag=True, expose_value=False, is_eager=True,
+    callback=_print_version,
+    help="Show the installer version and the platform version it deploys, then exit.",
+)
 def main():
     """Platform Installer — disconnected bare-metal → OpenShift deployment tool."""
 
