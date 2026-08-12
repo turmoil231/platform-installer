@@ -29,12 +29,12 @@ process-isolation executor (`process_isolation=True`). See
   (`process_isolation=True`, `container_image=...`) — it shells out to
   `podman/docker run <ansible-exec-image> ansible-playbook ...` per playbook.
   See `installer/runner/ansible.py`.
-- **CollectionManager** is a build-time validator only. It checks staged
-  collection tarballs against `collections.lock.yml` checksums before they're
-  baked into the Ansible execution image
-  (`packaging/build_ansible_image.sh`). It does not install anything at
-  deploy time — collections live inside that image exclusively, never on the
-  admin host.
+- **The installer has no concept of collection staging at all.** Collections
+  are baked into the Ansible execution image ahead of time, by whatever
+  process produces that image — `packaging/build_ansible_image.sh` is one
+  option, but the installer doesn't require or assume it. The CLI just takes
+  an `--ansible-image` tag and runs it; it never inspects, validates, or
+  installs collections itself.
 - **Two-file config model**: `platform-config.yaml` (topology/intent) +
   `platform-manifest.yaml` (all version pins and checksums).
 - **Distribution**: a compiled single binary (`platform-installer-<version>`,
@@ -56,7 +56,7 @@ platform-installer/
 │   ├── phases/
 │   │   └── base.py             # Phase base class + all phase implementations
 │   ├── runner/
-│   │   └── ansible.py          # AnsibleRunner (container executor) + CollectionManager
+│   │   └── ansible.py          # AnsibleRunner (container executor)
 │   └── state/
 │       └── store.py            # SQLite phase state store
 ├── ansible/
@@ -129,7 +129,7 @@ Required collections:
 
 ## What needs to be built (priority order)
 
-1. **Tests** — `tests/unit/` for config loader, models, state store, collection manager
+1. **Tests** — `tests/unit/` for config loader, models, state store
 2. **Playbooks** — stub playbooks for each phase (thin — they import_role from collections)
 3. **Ansible collection: platform.vmware** — ESXi install via Redfish, vCenter OVA deploy, dvSwitch, iSCSI
 4. **Ansible collection: platform.bootstrap** — bootstrap VM deploy, Vault/Artifactory containers

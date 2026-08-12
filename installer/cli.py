@@ -4,8 +4,8 @@ installer/cli.py
 Runs natively on the admin host as a compiled binary — no outer container.
 Ansible itself executes inside a preloaded "Ansible execution image" via
 ansible-runner's container executor (see installer/runner/ansible.py).
-Collections are baked into that image at build time; `validate` and
-`stage-collections` are build-time checks only, not part of `deploy`.
+Collections are baked into that image ahead of time — the installer never
+stages, validates, or otherwise concerns itself with collections at all.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from rich.table import Table
 from rich import box
 
 from installer.config.loader import ConfigLoader, ConfigValidationError
-from installer.runner.ansible import AnsibleRunner, CollectionManager
+from installer.runner.ansible import AnsibleRunner
 from installer.state.store import PhaseStatus, StateStore
 from installer.phases.base import ALL_PHASES, PHASE_NAMES, Phase
 
@@ -57,13 +57,6 @@ def _ansible_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys._MEIPASS) / "ansible"  # type: ignore[attr-defined]
     return Path(__file__).resolve().parents[1] / "ansible"
-
-
-def _resolve_collections_dir(loader: ConfigLoader, override: str | None) -> Path:
-    if override:
-        return Path(override).resolve()
-    staging_root = loader._raw_config.get("assets", {}).get("staging_root", "/mnt/platform-assets")
-    return Path(staging_root) / "collections"
 
 
 def _default_ansible_image() -> str:
@@ -186,10 +179,8 @@ def main():
 @main.command()
 @click.option("--config",           "-c", default="platform-config.yaml")
 @click.option("--manifest",         "-m", default=None)
-@click.option("--collections-dir",        default=None)
-@click.option("--collections-lock",       default="collections.lock.yml")
-def validate(config, manifest, collections_dir, collections_lock):
-    """Validate config, manifest, and staged collections without deploying."""
+def validate(config, manifest):
+    """Validate config and manifest without deploying."""
     console.rule("[bold]Configuration Validation[/bold]")
     loader = _load_config(config, manifest)
     console.print("[green]✔[/green] platform-config.yaml — valid")
@@ -197,22 +188,6 @@ def validate(config, manifest, collections_dir, collections_lock):
         f"[green]✔[/green] platform-manifest.yaml — "
         f"version {loader.manifest.get('manifest_version')} matches"
     )
-    coll_dir     = _resolve_collections_dir(loader, collections_dir)
-    ansible_dir  = _ansible_dir()
-    requirements = ansible_dir / "collections" / "requirements.yml"
-    manager = CollectionManager(
-        staged_collections_dir = coll_dir,
-        requirements_file      = requirements,
-        lock_file              = collections_lock if Path(collections_lock).exists() else None,
-        verify_checksums       = True,
-    )
-    errors = manager.validate_staged_assets()
-    if errors:
-        console.print("\n[bold red]Collection staging issues:[/bold red]")
-        for e in errors:
-            console.print(f"  [red]• {e}[/red]")
-        sys.exit(1)
-    console.print("[green]✔[/green] Collections — all staged and checksums valid")
 
 
 # ── status ─────────────────────────────────────────────────────────────────────
@@ -247,60 +222,6 @@ def reset(config, state_dir, phase):
             sys.exit(1)
         store.reset_phase(p)
         console.print(f"[yellow]↺[/yellow] {p} reset to pending")
-
-
-# ── stage-collections ──────────────────────────────────────────────────────────
-
-@main.command("stage-collections")
-@click.option("--config",           "-c", default="platform-config.yaml")
-@click.option("--collections-dir",        default=None)
-@click.option("--collections-lock",       default="collections.lock.yml")
-def stage_collections(config, collections_dir, collections_lock):
-    """
-    Verify all collection tarballs are staged and checksums match the lock file.
-
-    This does NOT fetch from the internet.  Run scripts/stage_collections.sh
-    in a connected environment first, then transfer tarballs here.
-    """
-    loader   = _load_config(config, None)
-    coll_dir = _resolve_collections_dir(loader, collections_dir)
-    ansible_dir  = _ansible_dir()
-    requirements = ansible_dir / "collections" / "requirements.yml"
-
-    console.rule("[bold]Collection Staging Verification[/bold]")
-    console.print(f"  Staged dir:   {coll_dir}")
-    console.print(f"  Requirements: {requirements}")
-    console.print(f"  Lock file:    {collections_lock}\n")
-
-    manager = CollectionManager(
-        staged_collections_dir = coll_dir,
-        requirements_file      = requirements,
-        lock_file              = collections_lock if Path(collections_lock).exists() else None,
-        verify_checksums       = True,
-    )
-    errors = manager.validate_staged_assets()
-    if errors:
-        console.print("[bold red]Staging validation FAILED:[/bold red]")
-        for e in errors:
-            console.print(f"  [red]• {e}[/red]")
-        console.print(
-            "\n[yellow]To populate staged collections, run on a connected host:[/yellow]\n"
-            "  ./scripts/stage_collections.sh \\\n"
-            "    --staging-root <path> \\\n"
-            "    --requirements ansible/collections/requirements.yml\n"
-            "Then transfer <staging-root>/collections/ to this host."
-        )
-        sys.exit(1)
-
-    console.print("[bold green]✔ All collections staged and verified[/bold green]")
-    tarballs = sorted(coll_dir.glob("*.tar.gz")) if coll_dir.exists() else []
-    if tarballs:
-        table = Table(box=box.SIMPLE)
-        table.add_column("Tarball")
-        table.add_column("Size", justify="right")
-        for t in tarballs:
-            table.add_row(t.name, f"{t.stat().st_size / 1_048_576:.1f} MB")
-        console.print(table)
 
 
 # ── deploy ─────────────────────────────────────────────────────────────────────
