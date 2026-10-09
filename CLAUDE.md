@@ -52,6 +52,12 @@ process-isolation executor (`process_isolation=True`). See
   The binary auto-loads the image into the local podman/docker store on
   first run if it isn't already present (`AnsibleRunner.ensure_ready()`) —
   no separate load step, no wrapper script.
+- **Progress reporting goes through `installer.tui.Reporter`.** Phases and
+  the Ansible runner report step start/finish/output through a reporter and
+  never print directly during a run. `installer.tui.run_installer` picks the
+  Textual dashboard (interactive terminal) or a plain, streaming log (CI or
+  no terminal), writes the log file and JUnit report, and returns the exit
+  code. See `installer/tui/CLAUDE.md`.
 
 ## Project structure
 
@@ -66,8 +72,9 @@ platform-installer/
 │   │   └── base.py             # Phase base class + all phase implementations
 │   ├── runner/
 │   │   └── ansible.py          # AnsibleRunner (container executor)
-│   └── state/
-│       └── store.py            # SQLite phase state store
+│   ├── state/
+│   │   └── store.py            # SQLite phase state store
+│   └── tui/                    # Progress UI: Textual dashboard / plain CI log (own CLAUDE.md)
 ├── ansible/
 │   ├── playbooks/              # Thin orchestration playbooks (call collection roles)
 │   └── collections/
@@ -78,7 +85,8 @@ platform-installer/
 │   ├── build_binary.sh             # PyInstaller build of the compiled CLI binary
 │   └── seed_pip_cache.sh           # Pre-downloads pip wheels for offline builds
 ├── scripts/
-│   └── stage_collections.sh   # Fetches collection tarballs from GitLab
+│   ├── stage_collections.sh   # Fetches collection tarballs from GitLab
+│   └── tui_demo.py             # Simulated install driving installer.tui (no infra needed)
 ├── vault-policies/             # Vault HCL policies seeded during bootstrap
 ├── pyproject.toml
 ├── platform-config.yaml.example
@@ -140,6 +148,9 @@ Required collections:
 - community.vmware, kubernetes.core, community.hashi_vault, redhat.rhel_system_roles
 
 ## What needs to be built (priority order)
+
+0. **TUI integration (in progress)**: wire `installer/tui/` into `deploy`
+   and `preflight`. The plan is in `installer/tui/INTEGRATION.md`.
 
 1. **Tests** — `tests/unit/` for config loader, models, state store
 2. **Playbooks** — stub playbooks for each phase (thin — they import_role from collections)
