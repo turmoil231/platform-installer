@@ -61,6 +61,7 @@ config-validation:
     - pip install --quiet -e . --find-links packaging/pip-cache || true
     - platform-installer validate
         --config platform-config.yaml.example
+        --manifest platform-manifest.yaml.example
   allow_failure: false
 
 schema-lint:

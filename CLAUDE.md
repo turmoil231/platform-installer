@@ -164,7 +164,8 @@ Nothing is written under the `ansible/` source tree at runtime anymore.
 - `platform_hauler` (`registry`, `fileserver_url`) and `platform_local_vault`
   (`addr`, `init_output_path`, `approle_credentials_path`): written from
   `LocalServices.ansible_vars()` into `vars/local_services.yml`.
-- Per-spoke vars: `platform_spoke` (merged defaults + cluster overrides)
+- Spokes: `platform_spoke_clusters` — `defaults` plus `clusters`, each cluster
+  already merged over the defaults (dicts merge, lists and scalars replace)
 - Secrets: always `vault:secret/path` strings resolved at task time
   via `community.hashi_vault.hashi_vault` lookup
 

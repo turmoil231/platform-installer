@@ -7,16 +7,22 @@ and produces the structures the installer and Ansible runner need.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
 from typing import Any
 
 import yaml
-from deepmerge import always_merger
+from deepmerge import Merger
 from pydantic import ValidationError
 
 from .models import PlatformConfig
+
+#: Merges a spoke's settings over spoke_clusters.defaults. Dicts merge key by
+#: key; anything else, lists included, is replaced — `dns_servers: [...]` on a
+#: spoke means exactly those servers, not the defaults plus those.
+SPOKE_MERGER = Merger([(dict, ["merge"])], ["override"], ["override"])
 
 
 class ConfigLoader:
@@ -58,17 +64,22 @@ class ConfigLoader:
 
         Output structure:
           output_dir/
-            all.yml          ← global, manifest, network
-            vmware.yml       ← vmware + bootstrap + mirror_registry
-            management.yml   ← management_services
-            hub.yml          ← hub_cluster + hub_services + storage
-            spoke_defaults.yml ← spoke_clusters.defaults
-            spokes/
-              spoke-01.yml   ← per-spoke vars (one file per cluster)
-            vdi.yml          ← vdi_services
+            all.yml            ← global, manifest, network
+            vmware.yml         ← vmware + bootstrap + mirror_registry
+            management.yml     ← management_services
+            hub.yml            ← hub_cluster + hub_services + storage
+            spoke_clusters.yml ← spoke_clusters, each cluster merged over the defaults
+            vdi.yml            ← vdi_services
+
+        Every file is merged into one set of extra-vars (see
+        AnsibleRunner._load_extra_vars), so variable names must be unique
+        across files. Previously generated files are removed first, so
+        nothing stale (e.g. a since-deleted spoke) carries over.
         """
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
+        for stale in out.rglob("*.yml"):
+            stale.unlink()
 
         raw = self._raw_config
         manifest = self._raw_manifest
@@ -97,18 +108,19 @@ class ConfigLoader:
             "platform_hub_services": raw.get("hub_services", {}),
         })
 
-        self._write_yaml(out / "spoke_defaults.yml", {
-            "platform_spoke_defaults": raw.get("spoke_clusters", {}).get("defaults", {}),
+        spokes   = raw.get("spoke_clusters", {})
+        defaults = spokes.get("defaults", {})
+        self._write_yaml(out / "spoke_clusters.yml", {
+            "platform_spoke_clusters": {
+                "defaults": defaults,
+                "clusters": [
+                    # Deep copies: the merger works in place, and every spoke
+                    # starts from the same defaults.
+                    SPOKE_MERGER.merge(copy.deepcopy(defaults), copy.deepcopy(spoke))
+                    for spoke in spokes.get("clusters", [])
+                ],
+            },
         })
-
-        spokes_dir = out / "spokes"
-        spokes_dir.mkdir(exist_ok=True)
-        defaults = raw.get("spoke_clusters", {}).get("defaults", {})
-        for spoke in raw.get("spoke_clusters", {}).get("clusters", []):
-            merged = always_merger.merge(dict(defaults), dict(spoke))
-            self._write_yaml(spokes_dir / f"{spoke['name']}.yml", {
-                "platform_spoke": merged,
-            })
 
         self._write_yaml(out / "vdi.yml", {
             "platform_vdi": raw.get("vdi_services", {}),
