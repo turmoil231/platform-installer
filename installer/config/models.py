@@ -105,38 +105,6 @@ class PlatformManifest(BaseModel):
     version: str
 
 
-# ── Assets ─────────────────────────────────────────────────────────────────────
-
-class GoldImage(BaseModel):
-    filename: str
-
-
-class GoldImagesConfig(BaseModel):
-    base_path: str
-    images:    dict[str, GoldImage]
-
-
-class OLMCatalog(BaseModel):
-    name:      str
-    image_tar: str
-
-
-class OLMCatalogsConfig(BaseModel):
-    base_path: str
-    catalogs:  list[OLMCatalog] = []
-
-
-class AssetsConfig(BaseModel):
-    staging_root:    str
-    gold_images:     GoldImagesConfig
-    isos:            dict[str, str]
-    rpms:            dict[str, Any] = {}
-    container_images: dict[str, Any] = {}
-    helm_charts:     dict[str, Any] = {}
-    olm_catalogs:    OLMCatalogsConfig
-    git_bundles:     dict[str, str] = {}
-
-
 # ── Inventory ──────────────────────────────────────────────────────────────────
 
 class BMCConfig(BaseModel):
@@ -701,7 +669,6 @@ class PlatformConfig(BaseModel):
 
     platform_manifest: PlatformManifest
     global_:           GlobalConfig = Field(alias="global")
-    assets:            AssetsConfig
     inventory:         InventoryConfig
     vmware:            VMwareConfig
     bootstrap:         BootstrapConfig
@@ -759,18 +726,5 @@ class PlatformConfig(BaseModel):
                             f"Server {node.server_ref!r} is claimed by both vmware.esxi and "
                             f"spoke_clusters[{spoke.name}] — a server cannot have two roles"
                         )
-
-        # Every gold_image reference must exist in assets.gold_images.images
-        valid_images = set(self.assets.gold_images.images.keys())
-        refs_to_check = []
-        if self.bootstrap.vm.gold_image:
-            refs_to_check.append(("bootstrap.vm.gold_image", self.bootstrap.vm.gold_image))
-        for key, val in self.vmware.esxi.get("hosts", [{}])[0].items():
-            pass  # ESXi image handled separately via assets.gold_images.images.esxi
-        for ref_name, ref_val in refs_to_check:
-            if ref_val not in valid_images:
-                raise ValueError(
-                    f"{ref_name}={ref_val!r} not found in assets.gold_images.images"
-                )
 
         return self

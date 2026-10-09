@@ -57,11 +57,7 @@ platform-installer --help
 |------|-------|
 | `platform-config.yaml` | Working directory |
 | `platform-manifest.yaml` | Same directory as config |
-| All staged assets | `assets.staging_root` on config |
-| Gold images + checksums | `assets.gold_images.base_path` |
-| Container images (OCI tarballs) | `assets.container_images.base_path` |
-| Helm charts (.tgz) | `assets.helm_charts.base_path` |
-| OLM catalog index tarballs | `assets.olm_catalogs.base_path` |
+| Rancher Hauler bundle (all staged assets: gold images, ISOs, container images, Helm charts, OLM catalogs, git bundles) | `.tar.zst` file, passed via `--haul-path` on `deploy`/`preflight` |
 | Internal CA cert + key | `global.tls.*` paths |
 | SSH key pair | `global.ssh.*` paths |
 | Merged pull secret | `global.pull_secret_path` |
@@ -82,13 +78,13 @@ platform-installer validate --config platform-config.yaml
 export VAULT_ROLE_ID=<role-id>
 export VAULT_SECRET_ID=<secret-id>
 
-platform-installer deploy --config platform-config.yaml
+platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst
 ```
 
 ### Dry run (validates + generates vars, skips Ansible)
 
 ```bash
-platform-installer deploy --config platform-config.yaml --dry-run
+platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst --dry-run
 ```
 
 ### Check status
@@ -116,13 +112,13 @@ Output:
 ```bash
 # Reset the failed phase and re-run from there
 platform-installer reset --config platform-config.yaml --phase management_services
-platform-installer deploy --config platform-config.yaml --from-phase management_services
+platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst --from-phase management_services
 ```
 
 ### Run a single phase
 
 ```bash
-platform-installer deploy --config platform-config.yaml --phase preflight
+platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst --phase preflight
 ```
 
 ### Run a range of phases
@@ -130,6 +126,7 @@ platform-installer deploy --config platform-config.yaml --phase preflight
 ```bash
 platform-installer deploy \
   --config platform-config.yaml \
+  --haul-path ./platform.tar.zst \
   --from-phase hub_cluster \
   --to-phase hub_services
 ```
@@ -139,13 +136,13 @@ platform-installer deploy \
 Set `global.automation.fully_automated: false` in your config, then:
 
 ```bash
-platform-installer deploy --config platform-config.yaml
+platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst
 # Installer will pause at each checkpoint defined in approval_checkpoints
 ```
 
 Or override for a single run:
 ```bash
-platform-installer deploy --config platform-config.yaml --auto-approve
+platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst --auto-approve
 ```
 
 ### Full deployment report
@@ -158,7 +155,7 @@ platform-installer report --config platform-config.yaml
 
 | Phase | What happens |
 |-------|-------------|
-| `preflight` | Validate config, check BMC/storage reachability, verify staged assets |
+| `preflight` | Validate config, check BMC/storage reachability, verify the Hauler bundle |
 | `vmware` | Install ESXi on claimed servers → deploy vCenter OVA → configure cluster, dvSwitch, datastores |
 | `bootstrap` | Deploy bootstrap VM → start Vault + Artifactory containers → seed both |
 | `management_services` | Deploy IDM VMs (primary + replica) → configure DNS/LDAP/CA/Kerberos → deploy Kea DHCP |

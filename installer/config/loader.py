@@ -58,7 +58,7 @@ class ConfigLoader:
 
         Output structure:
           output_dir/
-            all.yml          ← global, assets, manifest, network
+            all.yml          ← global, manifest, network
             vmware.yml       ← vmware + bootstrap + mirror_registry
             management.yml   ← management_services
             hub.yml          ← hub_cluster + hub_services + storage
@@ -75,7 +75,6 @@ class ConfigLoader:
 
         self._write_yaml(out / "all.yml", {
             "platform_global":   raw.get("global", {}),
-            "platform_assets":   raw.get("assets", {}),
             "platform_manifest": manifest,
             "platform_inventory_network": raw.get("inventory", {}).get("network", {}),
             "platform_inventory_compute": raw.get("inventory", {}).get("compute", {}),

@@ -15,6 +15,7 @@
 #   platform_vmware.esxi.iscsi
 #   platform_global.ntp_servers
 #   platform_global.tls.internal_ca_cert_path
+#   platform_haul_path (from --haul-path — see installer/cli.py::_make_runner)
 #
 # The `esxi_hosts` inventory group is populated by ConfigLoader from
 # inventory.compute servers claimed in vmware.esxi.hosts[].server.
@@ -29,8 +30,14 @@
       ansible.builtin.import_role:
         name: platform.vmware.redfish_virtual_media
       vars:
+        # TODO: platform.vmware.redfish_virtual_media needs to serve this ISO
+        # out of the Hauler haul at platform_haul_path (e.g. via
+        # `hauler store serve fileserver` from a role in a not-yet-built
+        # collection) rather than a URL — the "generic-local" Artifactory
+        # repo this pointed at no longer exists now that assets ship as a
+        # single Hauler bundle instead of pre-staged files.
         redfish_image_url: >-
-          http://{{ platform_vmware_bootstrap_ip }}/generic-local/{{ platform_assets.gold_images.images.esxi.filename }}
+          http://{{ platform_vmware_bootstrap_ip }}/generic-local/{{ platform_vmware.esxi.version_ref }}
         redfish_boot_once: true
 
     - name: "ESXi Install | Power cycle host"

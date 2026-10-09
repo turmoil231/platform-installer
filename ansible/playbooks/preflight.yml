@@ -3,11 +3,12 @@
 #
 # Preflight checks — run before any infrastructure is touched.
 # All checks are driven by vars generated from platform-config.yaml
-# by ConfigLoader.generate_ansible_vars().
+# by ConfigLoader.generate_ansible_vars(), plus platform_haul_path (written
+# directly from the --haul-path CLI flag — see installer/cli.py::_make_runner).
 #
 # Variables consumed (from group_vars/generated/all.yml):
 #   platform_global.*
-#   platform_assets.*
+#   platform_haul_path
 #   platform_manifest.*
 #   platform_inventory_compute.*
 #   platform_inventory_storage.*
@@ -36,61 +37,17 @@
           but loaded manifest declares a different version.
       tags: [manifest]
 
-    - name: "Preflight | Verify staging root exists"
+    - name: "Preflight | Verify Hauler bundle exists"
       ansible.builtin.stat:
-        path: "{{ platform_assets.staging_root }}"
-      register: staging_stat
-      tags: [disk_space]
+        path: "{{ platform_haul_path }}"
+      register: haul_stat
+      tags: [haul]
 
-    - name: "Preflight | Assert staging root is a directory"
+    - name: "Preflight | Assert Hauler bundle is a regular file"
       ansible.builtin.assert:
-        that: staging_stat.stat.isdir
-        fail_msg: "Staging root {{ platform_assets.staging_root }} does not exist or is not a directory"
-      tags: [disk_space]
-
-    - name: "Preflight | Check disk space on staging root"
-      ansible.builtin.command:
-        cmd: "df --block-size=G --output=avail {{ platform_assets.staging_root }}"
-      register: df_output
-      changed_when: false
-      tags: [disk_space]
-
-    - name: "Preflight | Assert sufficient disk space"
-      ansible.builtin.assert:
-        that: >
-          (df_output.stdout_lines[1] | regex_replace('G', '') | int) >=
-          (platform_preflight.checks |
-            selectattr('id', 'equalto', 'disk_space_staging') |
-            map(attribute='threshold_gb') | first | default(600))
-        fail_msg: >
-          Insufficient disk space on {{ platform_assets.staging_root }}.
-          Need at least {{ platform_preflight.checks |
-            selectattr('id', 'equalto', 'disk_space_staging') |
-            map(attribute='threshold_gb') | first | default(600) }}G.
-      tags: [disk_space]
-
-    - name: "Preflight | Verify gold images exist and match checksums"
-      ansible.builtin.include_tasks:
-        file: tasks/preflight/check_gold_image.yml
-        apply:
-          tags: [gold_images]
-      loop: "{{ platform_assets.gold_images.images | dict2items }}"
-      loop_control:
-        loop_var: image_item
-        label: "{{ image_item.key }}"
-      tags: [gold_images]
-
-    - name: "Preflight | Verify RHCOS ISO exists"
-      ansible.builtin.stat:
-        path: "{{ platform_assets.staging_root }}/{{ platform_assets.isos.base_path }}/{{ platform_assets.isos.rhcos_live_iso }}"
-      register: iso_stat
-      tags: [isos]
-
-    - name: "Preflight | Assert RHCOS ISO present"
-      ansible.builtin.assert:
-        that: iso_stat.stat.exists
-        fail_msg: "RHCOS ISO not found at expected staging path"
-      tags: [isos]
+        that: haul_stat.stat.exists and haul_stat.stat.isreg
+        fail_msg: "Hauler bundle not found (or not a file): {{ platform_haul_path }} — pass --haul-path to point at your .tar.zst haul."
+      tags: [haul]
 
     - name: "Preflight | Check Vault env vars are set"
       ansible.builtin.assert:

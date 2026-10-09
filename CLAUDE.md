@@ -37,6 +37,15 @@ process-isolation executor (`process_isolation=True`). See
   installs collections itself.
 - **Two-file config model**: `platform-config.yaml` (topology/intent) +
   `platform-manifest.yaml` (all version pins and checksums).
+- **Staged assets travel as a single Rancher Hauler bundle** (`.tar.zst`),
+  located via the required `--haul-path` flag on `deploy`/`preflight` — not a
+  config field. `platform-config.yaml` has no `assets` section at all; there
+  is no directory-tree-of-pre-staged-files model anymore (gold images, ISOs,
+  container images, Helm charts, OLM catalogs, git bundles are all inside the
+  haul). The path is bind-mounted into the Ansible execution container and
+  exposed to playbooks as `platform_haul_path`. How individual assets get
+  addressed out of the bundle (`hauler store extract`/`serve`, etc.) is an
+  Ansible-role concern, not something the Python installer understands.
 - **Distribution**: a compiled single binary (`platform-installer-<version>`,
   built by `packaging/build_binary.sh`) + a preloaded Ansible execution image
   tarball (built by `packaging/build_ansible_image.sh`), transferred together.
@@ -104,7 +113,10 @@ Nothing is written under the `ansible/` source tree at runtime anymore.
   `platform_global`, `platform_hub_cluster`, `platform_hub_services`,
   `platform_vmware`, `platform_management_services`, `platform_vdi`,
   `platform_inventory_compute`, `platform_inventory_storage`,
-  `platform_inventory_network`, `platform_manifest`, `platform_assets`
+  `platform_inventory_network`, `platform_manifest`
+- `platform_haul_path`: not config-derived — written directly from the
+  `--haul-path` CLI flag (see `installer/cli.py::_make_runner`), not through
+  `ConfigLoader.generate_ansible_vars()`.
 - Per-spoke vars: `platform_spoke` (merged defaults + cluster overrides)
 - Secrets: always `vault:secret/path` strings resolved at task time
   via `community.hashi_vault.hashi_vault` lookup

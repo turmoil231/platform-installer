@@ -191,7 +191,7 @@ class AnsibleRunner:
     host_mounts:
         External, user-provided host paths that must be visible inside the
         execution container but are NOT copied into private_data_dir (SSH
-        keypair, internal CA cert/key, pull secret, assets.staging_root).
+        keypair, internal CA cert/key, pull secret, the Hauler haul bundle).
         Each entry is (path, read_only). Mounted at the identical path
         inside the container, so extravars values referencing these paths
         (e.g. global.ssh.private_key_path) stay valid on both sides with no

@@ -9,11 +9,13 @@
 #   scripts/stage_collections.sh
 #   ... runs `ansible-galaxy collection install -r requirements.yml`
 #   ... against your internal GitLab instance and produces tarballs staged
-#   ... under assets.staging_root/collections/
+#   ... under <staging-root>/collections/, then baked into the Ansible
+#   ... execution image by packaging/build_ansible_image.sh.
 #
 # At deploy time (disconnected):
-#   The installer configures ANSIBLE_COLLECTIONS_PATH to point at the
-#   pre-staged tarballs.  No network access is required.
+#   Collections already live inside the Ansible execution image
+#   (--ansible-image). The installer never installs or references
+#   collections itself — see installer/runner/ansible.py.
 #
 # Version pins: always pin to a specific version or git ref.
 # Never use '*' or 'latest' — the platform manifest owns all version pins.

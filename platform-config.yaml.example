@@ -100,38 +100,11 @@ global:
 
 ##############################################################################
 # STAGED ASSETS
-# Everything must be pre-staged on the admin server before phase 0.
+# Not configured here — all deployment assets (gold images, ISOs, container
+# images, Helm charts, OLM catalogs, git bundles) travel as a single Rancher
+# Hauler bundle, passed via `platform-installer deploy --haul-path
+# <bundle>.tar.zst`. See installer/cli.py.
 ##############################################################################
-
-assets:
-  staging_root: "/mnt/platform-assets"
-  gold_images:
-    base_path: "gold-images"
-    # Filenames + SHA-256 checksums live in platform-manifest.yaml
-    images:
-      rhel9_base:     { filename: "rhel-9-base-gold.qcow2"     }
-      rhel9_minimal:  { filename: "rhel-9-minimal-gold.qcow2"  }
-      rhel9_ocp_node: { filename: "rhel-9-ocp-node-gold.qcow2" }
-      esxi:           { filename: "VMware-ESXi-8.0U3.iso"      }
-  isos:
-    base_path: "isos"
-    rhcos_live_iso: "rhcos-live.x86_64.iso"
-    rhcos_rootfs:   "rhcos-live-rootfs.x86_64.img"
-  rpms:
-    base_path: "rpms"
-  container_images:
-    base_path: "container-images"   # Image list sourced from manifest image_pins
-  helm_charts:
-    base_path: "helm-charts"
-  olm_catalogs:
-    base_path: "olm-catalogs"
-    catalogs:
-      - { name: "redhat-operator-index",    image_tar: "redhat-operator-index.tar"    }
-      - { name: "certified-operator-index", image_tar: "certified-operator-index.tar" }
-  git_bundles:
-    base_path: "git-bundles"
-    platform_manifests_bundle: "platform-manifests.bundle"
-    ztp_config_bundle:         "ztp-config.bundle"
 
 
 ##############################################################################
@@ -529,7 +502,7 @@ vmware:
   enabled: true
 
   esxi:
-    version_ref: "esxi"                      # Resolves to ISO in assets.gold_images
+    version_ref: "esxi"                      # Resolves to the ESXi ISO in the Hauler haul
     # Servers to install ESXi on — must exist in inventory.compute
     hosts:
       - server: "esxi-host-01"
@@ -1666,8 +1639,8 @@ preflight:
   checks:
     - id: "manifest_version_match"
       description: "platform-manifest.yaml version matches platform_manifest.version"
-    - id: "staged_assets_checksums"
-      description: "All gold images, ISOs, OLM catalogs match manifest SHA-256 pins"
+    - id: "haul_bundle_exists"
+      description: "The Rancher Hauler bundle at --haul-path exists and is a regular file"
     - id: "pull_secret_valid"
       description: "pull-secret.json contains auth entry for mirror registry"
     - id: "vault_env_set"
@@ -1680,9 +1653,6 @@ preflight:
       description: "FlashBlade management API reachable for all blades"
     - id: "flashblade_s3_reachable"
       description: "FlashBlade S3 endpoint reachable for all blades"
-    - id: "disk_space_staging"
-      description: "Staging root has >= 600 GB free"
-      threshold_gb: 600
     - id: "oob_network_reachable"
       description: "All BMC IPs in inventory.compute.*.bmc.address are pingable"
     - id: "ntp_reachable"

@@ -74,17 +74,13 @@ def _build_host_mounts(loader: ConfigLoader) -> list[tuple[Path, bool]]:
     AnsibleRunner docstring for why these are mounted rather than copied).
     """
     g = loader.config.global_  # type: ignore[union-attr]
-    mounts: list[tuple[Path, bool]] = [
+    return [
         (Path(g.ssh.public_key_path),       True),
         (Path(g.ssh.private_key_path),      True),
         (Path(g.tls.internal_ca_cert_path), True),
         (Path(g.tls.internal_ca_key_path),  True),
         (Path(g.pull_secret_path),          True),
     ]
-    staging_root = loader._raw_config.get("assets", {}).get("staging_root")
-    if staging_root:
-        mounts.append((Path(staging_root), True))
-    return mounts
 
 
 def _make_runner(
@@ -92,6 +88,7 @@ def _make_runner(
     state_dir:         Path,
     container_image:   str,
     container_runtime: str | None,
+    haul_path:         Path,
     dry_run:           bool,
 ) -> AnsibleRunner:
     ansible_dir      = _ansible_dir()
@@ -100,16 +97,27 @@ def _make_runner(
     loader.generate_ansible_vars(private_data_dir / "vars")
     loader.generate_ansible_inventory(private_data_dir / "inventory" / "hosts.yml")
 
+    # Not config-derived (haul_path is a per-run CLI flag, not part of
+    # platform-config.yaml) — written directly rather than through
+    # ConfigLoader.generate_ansible_vars().
+    vars_dir = private_data_dir / "vars"
+    vars_dir.mkdir(parents=True, exist_ok=True)
+    with (vars_dir / "haul.yml").open("w") as fh:
+        yaml.dump({"platform_haul_path": str(haul_path)}, fh)
+
     automation = loader.config.global_.automation  # type: ignore[union-attr]
     secrets    = loader._raw_config.get("secrets", {}).get("vault", {})
     vault_addr = secrets.get("bootstrap_addr", "http://localhost:8200")
+
+    host_mounts = _build_host_mounts(loader)
+    host_mounts.append((haul_path, True))
 
     return AnsibleRunner(
         ansible_dir          = ansible_dir,
         private_data_dir     = private_data_dir,
         container_image      = container_image,
         container_runtime    = container_runtime,
-        host_mounts          = _build_host_mounts(loader),
+        host_mounts          = host_mounts,
         vault_addr           = vault_addr,
         vault_role_id_env    = secrets.get("role_id_env",   "VAULT_ROLE_ID"),
         vault_secret_id_env  = secrets.get("secret_id_env", "VAULT_SECRET_ID"),
@@ -230,6 +238,10 @@ def reset(config, state_dir, phase):
 @click.option("--config",                   "-c", default="platform-config.yaml")
 @click.option("--manifest",                 "-m", default=None)
 @click.option("--state-dir",                      default=".platform-installer-state")
+@click.option("--haul-path",                      required=True,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Path to the Rancher Hauler bundle (.tar.zst) containing "
+                   "all staged deployment assets.")
 @click.option("--ansible-image",                  default=None,
               help="Tag of the preloaded Ansible execution image "
                    "(default: platform-ansible-exec:<installer version>).")
@@ -242,7 +254,7 @@ def reset(config, state_dir, phase):
 @click.option("--skip-health-checks",             is_flag=True, default=False)
 @click.option("--auto-approve",                   is_flag=True, default=False)
 def deploy(
-    config, manifest, state_dir, ansible_image, container_runtime,
+    config, manifest, state_dir, haul_path, ansible_image, container_runtime,
     phase, from_phase, to_phase, dry_run, skip_health_checks,
     auto_approve,
 ):
@@ -260,6 +272,7 @@ def deploy(
         loader=loader, state_dir=state_path,
         container_image=ansible_image or _default_ansible_image(),
         container_runtime=container_runtime,
+        haul_path=haul_path,
         dry_run=dry_run,
     )
     phases        = _instantiate_phases(runner, store, loader)
@@ -344,16 +357,20 @@ def deploy(
 @click.option("--config",             "-c", default="platform-config.yaml")
 @click.option("--manifest",           "-m", default=None)
 @click.option("--state-dir",                default=".platform-installer-state")
+@click.option("--haul-path",                required=True,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Path to the Rancher Hauler bundle (.tar.zst) containing "
+                   "all staged deployment assets.")
 @click.option("--ansible-image",            default=None)
 @click.option("--container-runtime",        default=None)
 @click.option("--dry-run",                  is_flag=True, default=False)
-def preflight(config, manifest, state_dir, ansible_image, container_runtime, dry_run):
+def preflight(config, manifest, state_dir, haul_path, ansible_image, container_runtime, dry_run):
     """Run preflight checks only."""
     ctx = click.get_current_context()
     ctx.invoke(
         deploy,
         config=config, manifest=manifest, state_dir=state_dir,
-        ansible_image=ansible_image, container_runtime=container_runtime,
+        haul_path=haul_path, ansible_image=ansible_image, container_runtime=container_runtime,
         phase="preflight", dry_run=dry_run, skip_health_checks=False,
         auto_approve=True, from_phase=None, to_phase=None,
     )
