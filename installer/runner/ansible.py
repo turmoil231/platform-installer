@@ -38,13 +38,24 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import ansible_runner
 import yaml
 from rich.console import Console
 
+from installer.tui.reporter import strip_ansi
+
+if TYPE_CHECKING:
+    from installer.tui.reporter import Reporter
+
+# Only for ensure_image_loaded(), which the CLI runs before the progress UI
+# starts. Everything during a run goes through AnsibleRunner.reporter.
 console = Console()
+
+#: Lines of playbook output used as the error detail when no failed task
+#: result was captured (e.g. a syntax error, or the container failed to start).
+FAILURE_TAIL_LINES = 40
 
 
 def _sha256(path: Path) -> str:
@@ -154,6 +165,9 @@ class PlaybookResult:
     stats:        dict[str, Any] = field(default_factory=dict)
     failed_hosts: list[str]      = field(default_factory=list)
     stdout:       str            = ""
+    #: The last failed task and its result, from runner_on_failed /
+    #: runner_on_unreachable events. Empty if none was seen.
+    last_failure: str            = ""
 
     @property
     def success(self) -> bool:
@@ -199,6 +213,11 @@ class AnsibleRunner:
 
     vault_addr:
         Active Vault address (bootstrap during early phases, hub later).
+
+    reporter:
+        Progress reporter (installer.tui.Reporter) that every playbook run
+        reports its step start/finish/output to. Attached by the CLI once
+        the progress UI has created it, before the first run_playbook().
     """
 
     def __init__(
@@ -227,6 +246,7 @@ class AnsibleRunner:
         self.retry_delay         = retry_delay
         self.dry_run             = dry_run
         self._image_ready        = False
+        self.reporter: "Reporter | None" = None
         # Resolved lazily in ensure_ready() — a dry-run (config validation,
         # --dry-run deploy) should never require podman/docker to be present.
         self._container_runtime_override = container_runtime
@@ -247,9 +267,7 @@ class AnsibleRunner:
         Switch the active Vault address.  Called by hub_services phase after
         Vault migration from bootstrap → hub is confirmed healthy.
         """
-        console.print(
-            f"  [cyan]Switching Vault address: {self.vault_addr} → {new_addr}[/cyan]"
-        )
+        self._reporter().log(f"Switching Vault address: {self.vault_addr} → {new_addr}")
         self.vault_addr = new_addr
 
     def run_playbook(
@@ -259,63 +277,108 @@ class AnsibleRunner:
         tags:       list[str] | None = None,
         limit:      str | None = None,
         retries:    int | None = None,
+        *,
+        step_id:    str,
     ) -> PlaybookResult:
         """
         Run a playbook from ansible/playbooks/<playbook> inside the Ansible
         execution image. The playbook may import_role or include_tasks from
         any collection baked into that image via its fully-qualified
         collection name (FQCN).
+
+        Reports as a single progress step, `step_id`: retries are output
+        lines within it, not new steps. An exception still finishes the step
+        (as failed) before propagating.
         """
+        reporter = self._reporter()
+
         playbook_src = self.ansible_dir / "playbooks" / playbook
         if not playbook_src.exists():
-            raise FileNotFoundError(
+            message = (
                 f"Playbook not found: {playbook_src}\n"
                 f"Ensure the playbook exists in ansible/playbooks/"
             )
+            reporter.start_step(step_id)
+            reporter.finish_step(step_id, success=False, error=message)
+            raise FileNotFoundError(message)
 
+        if self.dry_run:
+            reporter.skip_step(step_id, reason="dry run")
+            return PlaybookResult(rc=0, status="successful")
+
+        reporter.start_step(step_id)
+        try:
+            result = self._run_with_retries(playbook, extra_vars or {}, tags, limit, retries, step_id)
+        except Exception as exc:
+            reporter.finish_step(step_id, success=False, error=f"{type(exc).__name__}: {exc}")
+            raise
+
+        reporter.finish_step(
+            step_id,
+            success=result.success,
+            error=None if result.success else self._failure_detail(result),
+        )
+        return result
+
+    # ── Internal ───────────────────────────────────────────────────────────────
+
+    def _reporter(self) -> "Reporter":
+        if self.reporter is None:
+            raise RuntimeError("AnsibleRunner.reporter must be attached before running playbooks")
+        return self.reporter
+
+    def _run_with_retries(
+        self,
+        playbook:   str,
+        extra_vars: dict[str, Any],
+        tags:       list[str] | None,
+        limit:      str | None,
+        retries:    int | None,
+        step_id:    str,
+    ) -> PlaybookResult:
+        reporter     = self._reporter()
         max_attempts = (retries if retries is not None else self.max_retries) + 1
         last_result: PlaybookResult | None = None
 
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
-                console.print(
-                    f"  [yellow]Retry {attempt - 1}/{max_attempts - 1} "
-                    f"in {self.retry_delay}s …[/yellow]"
+                reporter.append_output(
+                    step_id,
+                    f"Retry {attempt - 1}/{max_attempts - 1} in {self.retry_delay}s …",
                 )
                 time.sleep(self.retry_delay)
 
             label = f"ansible-playbook {playbook}"
             if max_attempts > 1:
                 label += f" (attempt {attempt}/{max_attempts})"
-            if self.dry_run:
-                label += " [DRY RUN]"
+            reporter.append_output(step_id, f"▶ {label}")
 
-            console.print(f"  [bold cyan]▶ {label}[/bold cyan]")
-
-            if self.dry_run:
-                console.print("  [dim]Dry-run — skipping execution[/dim]")
-                return PlaybookResult(rc=0, status="successful")
-
-            result = self._execute(playbook, extra_vars or {}, tags, limit)
+            result = self._execute(playbook, extra_vars, tags, limit, step_id)
             last_result = result
-
             if result.success:
-                console.print(f"  [green]✔ {playbook} completed[/green]")
                 return result
 
-            console.print(
-                f"  [red]✘ {playbook} failed (rc={result.rc}, status={result.status})[/red]"
+            reporter.append_output(
+                step_id, f"✘ {playbook} failed (rc={result.rc}, status={result.status})"
             )
             if result.failed_hosts:
-                console.print(
-                    f"  [red]  Failed hosts: {', '.join(result.failed_hosts)}[/red]"
-                )
-            if attempt == max_attempts:
-                break
+                reporter.append_output(step_id, f"  Failed hosts: {', '.join(result.failed_hosts)}")
 
         return last_result  # type: ignore[return-value]
 
-    # ── Internal ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def _failure_detail(result: PlaybookResult) -> str:
+        """Error text for the progress UI's Errors tab and the JUnit failure body."""
+        lines = [f"rc={result.rc} status={result.status}"]
+        if result.failed_hosts:
+            lines.append(f"Failed hosts: {', '.join(result.failed_hosts)}")
+        if result.last_failure:
+            lines.append(result.last_failure)
+        elif result.stdout:
+            tail = strip_ansi(result.stdout).splitlines()[-FAILURE_TAIL_LINES:]
+            lines.append(f"Last {len(tail)} lines of output:")
+            lines.extend(tail)
+        return "\n".join(lines)
 
     def _sync_project(self) -> None:
         """
@@ -355,6 +418,7 @@ class AnsibleRunner:
         extra_vars: dict[str, Any],
         tags:       list[str] | None,
         limit:      str | None,
+        step_id:    str,
     ) -> PlaybookResult:
         self.ensure_ready()
         self._sync_project()
@@ -402,14 +466,23 @@ class AnsibleRunner:
             if proxy_var in os.environ:
                 env_vars[proxy_var] = os.environ[proxy_var]
 
+        reporter = self._reporter()
         collected_stdout: list[str] = []
+        last_failure: list[str] = []
 
         def event_handler(event: dict[str, Any]) -> None:
             line = event.get("stdout", "")
             if line:
                 for ln in line.splitlines():
-                    console.print(f"    {ln}", markup=False, highlight=False)
+                    reporter.append_output(step_id, ln)
                 collected_stdout.append(line)
+            if event.get("event") in ("runner_on_failed", "runner_on_unreachable"):
+                data = event.get("event_data", {})
+                if not data.get("ignore_errors"):
+                    last_failure[:] = [
+                        f"Last failed task: {data.get('task', '?')} on {data.get('host', '?')}",
+                        strip_ansi(json.dumps(data.get("res", {}), indent=2, default=str)),
+                    ]
 
         job_name = Path(playbook).stem
 
@@ -439,4 +512,5 @@ class AnsibleRunner:
             stats        = stats,
             failed_hosts = failed,
             stdout       = "\n".join(collected_stdout),
+            last_failure = "\n".join(last_failure),
         )

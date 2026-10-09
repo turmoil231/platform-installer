@@ -10,8 +10,8 @@ It was developed as a standalone prototype (`terminal-ui` repo, commit
 `b999216`) and vendored here. It is now owned by this repo, so change it
 freely. The upstream repo is no longer maintained.
 
-If `INTEGRATION.md` exists in this directory, the TUI is not fully wired into
-the CLI yet. Read that file for the plan.
+It's wired into `deploy`/`preflight` through `installer/cli.py`
+(`build_plan`, `make_install`). See the root `CLAUDE.md`.
 
 ## Boundary
 

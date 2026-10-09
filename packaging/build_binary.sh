@@ -125,6 +125,7 @@ mkdir -p "${PYINSTALLER_WORKDIR}"
   --workpath "${PYINSTALLER_WORKDIR}/build" \
   --specpath "${PYINSTALLER_WORKDIR}" \
   --add-data "${REPO_ROOT}/ansible:ansible" \
+  --collect-submodules textual \
   --console \
   --clean \
   --noconfirm \

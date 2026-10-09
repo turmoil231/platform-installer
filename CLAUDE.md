@@ -58,6 +58,24 @@ process-isolation executor (`process_isolation=True`). See
   Textual dashboard (interactive terminal) or a plain, streaming log (CI or
   no terminal), writes the log file and JUnit report, and returns the exit
   code. See `installer/tui/CLAUDE.md`.
+- **The plan is built before the run.** Each phase declares its playbooks in
+  `planned_playbooks()`, and the shared `Phase.run()` iterates over that same
+  list. `cli.build_plan()` turns it into the TUI plan: one step per playbook
+  (`<phase>.<playbook stem>`) plus `<phase>.health_check` for phases that
+  override `health_check()`. `cli.make_install()` builds the
+  `install(reporter)` closure that `deploy` hands to `tui.run_installer`. It
+  never prints, prompts or `sys.exit()`s. On failure it finishes the step and
+  returns. Phases that won't run are `skip_step`ped ("not selected",
+  "already complete", "dry run").
+- **`AnsibleRunner.reporter`** is attached by `install()`. `run_playbook()`
+  takes a `step_id` and reports one step per playbook: retries are output
+  lines, and the failure detail is the failed hosts plus the last failed
+  task's result. `deploy` calls `runner.ensure_ready()` (image auto-load, which
+  prints) before the dashboard starts.
+- **Approval checkpoints** (`pre_<phase>` / `post_<phase>`) are prompted only
+  in `--ui plain` at an interactive terminal. Otherwise `deploy` refuses to
+  start unless `--auto-approve`/`fully_automated` is set.
+- **Dry runs never touch the state store.**
 
 ## Project structure
 
@@ -148,9 +166,6 @@ Required collections:
 - community.vmware, kubernetes.core, community.hashi_vault, redhat.rhel_system_roles
 
 ## What needs to be built (priority order)
-
-0. **TUI integration (in progress)**: wire `installer/tui/` into `deploy`
-   and `preflight`. The plan is in `installer/tui/INTEGRATION.md`.
 
 1. **Tests** — `tests/unit/` for config loader, models, state store
 2. **Playbooks** — stub playbooks for each phase (thin — they import_role from collections)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Callable
 
 import click
 import yaml
@@ -20,6 +21,7 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
+from installer import tui
 from installer.config.loader import ConfigLoader, ConfigValidationError
 from installer.runner.ansible import AnsibleRunner
 from installer.state.store import PhaseStatus, StateStore
@@ -136,6 +138,137 @@ def _instantiate_phases(runner: AnsibleRunner, store: StateStore, loader: Config
     return [Cls(runner=runner, store=store, config_vars=merged) for Cls in ALL_PHASES]
 
 
+def build_plan(phases: list[Phase]) -> tui.InstallPlan:
+    """
+    Progress-UI plan: one tui.Phase per installer phase, one tui.Step per
+    planned playbook plus a health-check step for phases that have one.
+    Phases that won't run are still in the plan (and skipped by install()),
+    so the operator sees the whole deployment.
+    """
+    plan = tui.InstallPlan()
+    for p in phases:
+        ui_phase = tui.Phase(id=p.name, name=p.name)
+        for pb in p.planned_playbooks():
+            ui_phase.steps.append(tui.Step(id=p.step_id(pb.playbook), name=pb.playbook, phase_id=p.name))
+        if p.has_health_check:
+            ui_phase.steps.append(
+                tui.Step(id=p.health_check_step_id, name=f"{p.name} health check", phase_id=p.name)
+            )
+        plan.phases.append(ui_phase)
+    return plan
+
+
+def checkpoint_before(phase_name: str, checkpoints: set[str]) -> str | None:
+    """
+    The approval checkpoint (if any) that gates the start of `phase_name`:
+    `pre_<phase>`, or `post_<previous phase>` (the phase before it in
+    PHASE_NAMES order).
+    """
+    if f"pre_{phase_name}" in checkpoints:
+        return f"pre_{phase_name}"
+    idx = PHASE_NAMES.index(phase_name)
+    if idx > 0 and f"post_{PHASE_NAMES[idx - 1]}" in checkpoints:
+        return f"post_{PHASE_NAMES[idx - 1]}"
+    return None
+
+
+def make_install(
+    *,
+    plan:               tui.InstallPlan,
+    phases:             list[Phase],
+    run_names:          set[str],
+    store:              StateStore,
+    runner:             AnsibleRunner,
+    checkpoints:        set[str],
+    confirm:            Callable[[str], bool],
+    hub_vault_addr:     str,
+    dry_run:            bool,
+    skip_health_checks: bool,
+):
+    """
+    Build the install(reporter) function that run_installer() drives.
+
+    Nothing in here may print, prompt (except through `confirm`, only ever
+    a real prompt in plain mode at an interactive terminal), or sys.exit():
+    under the dashboard it runs on a background thread. A failure finishes
+    the failing step and returns, leaving later steps pending, which is what
+    makes run_installer() exit 1. The state store stays the source of truth
+    for resume; a dry run never writes to it.
+    """
+    steps_by_phase = {ui_phase.id: [s.id for s in ui_phase.steps] for ui_phase in plan.phases}
+
+    def install(reporter: tui.Reporter) -> None:
+        runner.reporter = reporter
+
+        def skip_phase(p: Phase, reason: str) -> None:
+            for step_id in steps_by_phase[p.name]:
+                reporter.skip_step(step_id, reason=reason)
+
+        for p in phases:
+            if p.name not in run_names:
+                skip_phase(p, "not selected")
+                continue
+
+            record = store.get_phase(p.name)
+            if record and record.is_complete:
+                skip_phase(p, "already complete")
+                continue
+
+            gate = checkpoint_before(p.name, checkpoints)
+            if gate and not confirm(f"Checkpoint {gate}: continue with '{p.name}'?"):
+                reporter.log(f"Stopped at approval checkpoint {gate} before {p.name}", level="warning")
+                return
+
+            # Switch Vault to hub address after hub_services completes
+            if p.name == "hub_services" and hub_vault_addr:
+                runner.switch_vault_addr(hub_vault_addr)
+
+            reporter.log(f"Phase {p.name}")
+
+            if dry_run:
+                p.run()  # every playbook step is skipped as "dry run"
+                if p.has_health_check:
+                    reporter.skip_step(p.health_check_step_id, reason="dry run")
+                continue
+
+            with store.phase_context(p.name) as ctx:
+                try:
+                    result = p.run()
+                except Exception as exc:
+                    # The runner has already finished the step that raised.
+                    ctx.fail(rc=1, message=str(exc))
+                    reporter.log(f"{p.name} raised: {exc}", level="error")
+                    return
+
+                if not result.success:
+                    ctx.fail(rc=result.rc, message=result.message)
+                    reporter.log(f"{p.name} FAILED: {result.message}", level="error")
+                    return
+
+                if p.has_health_check:
+                    hc = p.health_check_step_id
+                    if skip_health_checks:
+                        reporter.skip_step(hc, reason="--skip-health-checks")
+                    else:
+                        reporter.start_step(hc)
+                        try:
+                            healthy = p.health_check()
+                        except Exception as exc:
+                            reporter.finish_step(hc, success=False, error=f"{type(exc).__name__}: {exc}")
+                            ctx.fail(rc=1, message=f"Health check raised: {exc}")
+                            return
+                        reporter.finish_step(hc, success=healthy, error=None if healthy else "Health check failed")
+                        if not healthy:
+                            ctx.fail(rc=1, message="Health check failed")
+                            reporter.log(f"{p.name} health check FAILED", level="error")
+                            return
+
+                ctx.complete(message=result.message)
+                reporter.log(f"{p.name}: {result.message}")
+
+    return install
+
+
 def _print_phase_table(store: StateStore) -> None:
     table = Table(box=box.ROUNDED, padding=(0, 1))
     table.add_column("Phase",   style="bold")
@@ -234,6 +367,23 @@ def reset(config, state_dir, phase):
 
 # ── deploy ─────────────────────────────────────────────────────────────────────
 
+def _progress_options(f):
+    """Progress UI / reporting options shared by deploy and preflight."""
+    f = click.option("--exit-when-done",              is_flag=True, default=False,
+                     help="Close the dashboard as soon as the run finishes.")(f)
+    f = click.option("--log-file",                    default=None,
+                     type=click.Path(dir_okay=False, path_type=Path),
+                     help="Append the run log here (default: <state-dir>/install.log).")(f)
+    f = click.option("--junit",                       default=None,
+                     type=click.Path(dir_okay=False, path_type=Path),
+                     help="Write a JUnit XML report of every step to this path.")(f)
+    f = click.option("--ui",                          default="auto", show_default=True,
+                     type=click.Choice(tui.UI_MODES),
+                     help="tui: dashboard; plain: streaming log (CI); "
+                          "auto: dashboard only at an interactive terminal.")(f)
+    return f
+
+
 @main.command()
 @click.option("--config",                   "-c", default="platform-config.yaml")
 @click.option("--manifest",                 "-m", default=None)
@@ -253,10 +403,11 @@ def reset(config, state_dir, phase):
 @click.option("--dry-run",                        is_flag=True, default=False)
 @click.option("--skip-health-checks",             is_flag=True, default=False)
 @click.option("--auto-approve",                   is_flag=True, default=False)
+@_progress_options
 def deploy(
     config, manifest, state_dir, haul_path, ansible_image, container_runtime,
     phase, from_phase, to_phase, dry_run, skip_health_checks,
-    auto_approve,
+    auto_approve, ui, junit, log_file, exit_when_done,
 ):
     """Run the full deployment or a subset of phases."""
     console.rule("[bold blue]Platform Installer[/bold blue]")
@@ -291,8 +442,9 @@ def deploy(
             if idx is None:
                 console.print(f"[red]Unknown --from-phase: {from_phase!r}[/red]")
                 sys.exit(1)
-            for p in run_list[idx:]:
-                store.reset_phase(p.name)
+            if not dry_run:
+                for p in run_list[idx:]:
+                    store.reset_phase(p.name)
             run_list = run_list[idx:]
         if to_phase:
             idx = next((i for i, p in enumerate(run_list) if p.name == to_phase), None)
@@ -300,55 +452,55 @@ def deploy(
                 console.print(f"[red]Unknown --to-phase: {to_phase!r}[/red]")
                 sys.exit(1)
             run_list = run_list[:idx + 1]
+    run_names = {p.name for p in run_list}
 
     automation  = loader.config.global_.automation  # type: ignore[union-attr]
     fully_auto  = automation.fully_automated or auto_approve
-    checkpoints = set(automation.approval_checkpoints)
+    checkpoints = set() if fully_auto else set(automation.approval_checkpoints)
+    mode        = tui.choose_ui(ui)
 
+    # Checkpoints can only be answered in plain mode at an interactive
+    # terminal: the dashboard owns the terminal, and in CI nobody can answer.
+    gates = []
     for p in run_list:
         record = store.get_phase(p.name)
-        if record and record.is_complete:
-            console.print(f"[dim]⊘  {p.name}: already complete — skipping[/dim]")
-            continue
+        gate   = checkpoint_before(p.name, checkpoints)
+        if gate and not (record and record.is_complete):
+            gates.append(gate)
+    if gates and (mode == "tui" or not sys.stdin.isatty()):
+        console.print(
+            f"[bold red]Approval checkpoints would pause this run:[/bold red] {', '.join(gates)}\n"
+            f"They can't be answered under the dashboard or without an interactive terminal. "
+            f"Re-run with --auto-approve, set global.automation.fully_automated: true, "
+            f"or use --ui plain at a terminal to answer them."
+        )
+        sys.exit(1)
 
-        if not fully_auto and f"post_{p.name}" in checkpoints:
-            click.confirm(f"\n⚑  Checkpoint before '{p.name}'. Continue?", abort=True)
+    # Image loading prints progress and can take minutes: finish it before
+    # the dashboard takes over the terminal.
+    if not dry_run:
+        try:
+            runner.ensure_ready()
+        except RuntimeError as exc:
+            console.print(f"[bold red]ANSIBLE IMAGE ERROR:[/bold red] {exc}")
+            sys.exit(1)
 
-        # Switch Vault to hub address after hub_services completes
-        if p.name == "hub_services":
-            secrets   = loader._raw_config.get("secrets", {}).get("vault", {})
-            hub_vault = secrets.get("hub_addr", "")
-            if hub_vault:
-                runner.switch_vault_addr(hub_vault)
-
-        console.rule(f"[bold]Phase: {p.name}[/bold]")
-
-        with store.phase_context(p.name) as ctx:
-            try:
-                result = p.run()
-            except Exception as exc:
-                ctx.fail(rc=1, message=str(exc))
-                console.print(f"[bold red]✘ {p.name} raised: {exc}[/bold red]")
-                sys.exit(1)
-
-            if not result.success:
-                ctx.fail(rc=result.rc, message=result.message)
-                console.print(f"[bold red]✘ {p.name} FAILED: {result.message}[/bold red]")
-                _print_phase_table(store)
-                sys.exit(result.rc or 1)
-
-            if not skip_health_checks:
-                console.print(f"  [dim]Health check: {p.name} …[/dim]")
-                if not p.health_check():
-                    ctx.fail(rc=1, message="Health check failed")
-                    console.print(f"[bold red]✘ {p.name} health check FAILED[/bold red]")
-                    sys.exit(1)
-
-            ctx.complete(message=result.message)
-            console.print(f"[bold green]✔ {p.name}: {result.message}[/bold green]")
-
-    console.rule("[bold green]Deployment Complete[/bold green]")
-    _print_phase_table(store)
+    secrets = loader._raw_config.get("secrets", {}).get("vault", {})
+    plan    = build_plan(phases)
+    install = make_install(
+        plan=plan, phases=phases, run_names=run_names, store=store, runner=runner,
+        checkpoints=checkpoints,
+        confirm=lambda question: click.confirm(question, default=False),
+        hub_vault_addr=secrets.get("hub_addr", ""),
+        dry_run=dry_run, skip_health_checks=skip_health_checks,
+    )
+    sys.exit(tui.run_installer(
+        plan, install,
+        ui=mode,
+        junit_path=junit,
+        log_path=log_file or state_path / "install.log",
+        exit_when_done=exit_when_done,
+    ))
 
 
 # ── preflight (alias) ──────────────────────────────────────────────────────────
@@ -364,7 +516,11 @@ def deploy(
 @click.option("--ansible-image",            default=None)
 @click.option("--container-runtime",        default=None)
 @click.option("--dry-run",                  is_flag=True, default=False)
-def preflight(config, manifest, state_dir, haul_path, ansible_image, container_runtime, dry_run):
+@_progress_options
+def preflight(
+    config, manifest, state_dir, haul_path, ansible_image, container_runtime, dry_run,
+    ui, junit, log_file, exit_when_done,
+):
     """Run preflight checks only."""
     ctx = click.get_current_context()
     ctx.invoke(
@@ -373,6 +529,7 @@ def preflight(config, manifest, state_dir, haul_path, ansible_image, container_r
         haul_path=haul_path, ansible_image=ansible_image, container_runtime=container_runtime,
         phase="preflight", dry_run=dry_run, skip_health_checks=False,
         auto_approve=True, from_phase=None, to_phase=None,
+        ui=ui, junit=junit, log_file=log_file, exit_when_done=exit_when_done,
     )
 
 

@@ -128,7 +128,7 @@ class InstallerApp(App[None]):
         text-style: bold;
     }
     """
-    TITLE = "Platform Bootstrap"
+    TITLE = "Platform Installer"
 
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
@@ -236,7 +236,9 @@ class InstallerApp(App[None]):
         step = self.plan.get_step(step_id)
         step.output.append(line)
         rendered = Text(f"{step.name} | ", style="dim")
-        rendered.append(line)
+        # Ansible runs with ANSIBLE_FORCE_COLOR: turn its escape codes into
+        # styles rather than writing them out as raw control characters.
+        rendered.append_text(Text.from_ansi(line))
         self._output_log().write(rendered)
 
     def log_message(self, message: str, level: str = "info") -> None:

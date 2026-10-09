@@ -87,6 +87,24 @@ platform-installer deploy --config platform-config.yaml --haul-path ./platform.t
 platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst --dry-run
 ```
 
+A dry run never writes to the state store and skips health checks.
+
+### Progress UI, logs and CI
+
+At an interactive terminal, `deploy` and `preflight` show a live dashboard
+(every phase and playbook, streaming Ansible output, and an Errors tab).
+In CI, or when output is piped, they write a plain, streaming log instead.
+
+| Option | Default | |
+|---|---|---|
+| `--ui auto\|tui\|plain` | `auto` | `auto` picks the dashboard only at an interactive terminal outside CI |
+| `--log-file PATH` | `<state-dir>/install.log` | Appended to on every run; the durable record once the dashboard closes |
+| `--junit PATH` | — | JUnit XML report, one test case per step |
+| `--exit-when-done` | off | Close the dashboard as soon as the run finishes (otherwise press `q`) |
+
+Exit code: `0` if every step succeeded or was skipped, `1` if anything failed or
+didn't run, `130` on Ctrl-C.
+
 ### Check status
 
 ```bash
@@ -136,9 +154,14 @@ platform-installer deploy \
 Set `global.automation.fully_automated: false` in your config, then:
 
 ```bash
-platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst
+platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst --ui plain
 # Installer will pause at each checkpoint defined in approval_checkpoints
+# (pre_<phase>: before that phase; post_<phase>: before the phase after it)
 ```
+
+Checkpoints can only be answered in `--ui plain` at an interactive terminal.
+Under the dashboard, or without a terminal (CI), `deploy` refuses to start if
+any checkpoint would fire. Pass `--auto-approve` or set `fully_automated: true`.
 
 Or override for a single run:
 ```bash
