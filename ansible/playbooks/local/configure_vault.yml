@@ -1,0 +1,37 @@
+---
+# ansible/playbooks/local/configure_vault.yml
+# Configure the Vault container the installer runs on the admin host
+# (installer/runner/services.py).
+#
+# Runs at the start of EVERY deploy, outside the state store — the local
+# Vault comes back sealed after any container or host restart. Must be
+# idempotent: initialize if not initialized, unseal if sealed, ensure the
+# AppRole, policies and seeded secrets.
+#
+# Variables consumed (from vars/local_services.yml, written by the installer):
+#   platform_local_vault.addr                      e.g. http://127.0.0.1:8200
+#   platform_local_vault.init_output_path          write `vault operator init` output here
+#   platform_local_vault.approle_credentials_path  write {role_id, secret_id} here (JSON or YAML)
+#
+# Both paths are configurable in platform-config.yaml (local_services.vault)
+# and their directories are bind-mounted read-write into this container at
+# the same path. Every later playbook gets the AppRole credentials from
+# approle_credentials_path as VAULT_ROLE_ID / VAULT_SECRET_ID.
+#
+# TODO: Implement using roles from the Vault configuration collection.
+# Pattern: import_role from the collection, pass vars from platform_local_vault.
+
+- name: "TODO: Initialize, unseal and configure the admin host's local Vault"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  # Runs inside the execution container against the local Vault's API; see
+  # preflight.yml for why become must be off for connection: local plays.
+  become: false
+
+  tasks:
+    - name: "Stub | Not yet implemented"
+      ansible.builtin.fail:
+        msg: >
+          This playbook is a stub and has not been implemented yet.
+          See CLAUDE.md for implementation guidance.

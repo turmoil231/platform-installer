@@ -10,13 +10,24 @@ from pathlib import Path
 import pytest
 
 from installer import tui
-from installer.cli import build_plan, checkpoint_before, make_install
+from installer.cli import (
+    CONFIGURE_VAULT, CONFIGURE_VAULT_STEP_ID, LOCAL_SERVICES,
+    build_plan, checkpoint_before, make_install,
+)
 from installer.phases.base import ALL_PHASES, PHASE_NAMES, VMwarePhase
 from installer.runner.ansible import AnsibleRunner, PlaybookResult
 from installer.state.store import PhaseStatus, StateStore
 
 ANSIBLE_DIR = Path(__file__).resolve().parents[2] / "ansible"
 Status = tui.StepStatus
+
+
+class FakeLocalServices:
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
 
 
 class Harness:
@@ -28,6 +39,9 @@ class Harness:
         self.executed: list[str] = []
         self.store = StateStore(tmp_path / "state.db")
         self.store.initialize(PHASE_NAMES)
+        self.local_services: FakeLocalServices | None = FakeLocalServices()
+        self.hub_vault_addr = ""
+        self.runner: AnsibleRunner | None = None
 
     def _fake_execute(self, playbook, extra_vars, tags, limit, step_id):
         self.executed.append(playbook)
@@ -47,8 +61,10 @@ class Harness:
         runner = AnsibleRunner(
             ansible_dir=ANSIBLE_DIR, private_data_dir=self.tmp_path / "pdd",
             container_image="platform-ansible-exec:test", vault_addr="http://vault:8200",
+            vault_credentials_file=self.tmp_path / "approle.json",
             max_retries=0, retry_delay=0, dry_run=self.dry_run,
         )
+        self.runner = runner
         runner._execute = self._fake_execute  # type: ignore[method-assign]
         phases = [Cls(runner=runner, store=self.store, config_vars={}) for Cls in ALL_PHASES]
         plan   = build_plan(phases)
@@ -57,7 +73,8 @@ class Harness:
             run_names=run_names if run_names is not None else set(PHASE_NAMES),
             store=self.store, runner=runner,
             checkpoints=checkpoints or set(), confirm=confirm,
-            hub_vault_addr="", dry_run=self.dry_run, skip_health_checks=skip_health_checks,
+            hub_vault_addr=self.hub_vault_addr, local_services=self.local_services,
+            dry_run=self.dry_run, skip_health_checks=skip_health_checks,
         )
         rc = tui.run_installer(plan, install, ui="plain")
         return rc, plan
@@ -83,7 +100,7 @@ def test_plan_has_a_step_per_planned_playbook_plus_health_checks(harness):
         "vmware.install_esxi", "vmware.deploy_vcenter", "vmware.configure_vcenter",
         "vmware.configure_storage", "vmware.health_check",
     ]
-    assert [p.id for p in plan.phases] == PHASE_NAMES
+    assert [p.id for p in plan.phases] == [LOCAL_SERVICES, *PHASE_NAMES]
 
 
 def test_success_runs_everything_and_exits_0(harness):
@@ -118,7 +135,7 @@ def test_resume_skips_completed_phases_and_exits_0(harness):
     rc, plan = harness.run()
 
     assert rc == 0
-    assert harness.executed[0] == "management/deploy_idm.yml"
+    assert harness.executed[:2] == [CONFIGURE_VAULT, "management/deploy_idm.yml"]
     assert statuses(plan, "bootstrap") == {Status.SKIPPED}
     assert plan.get_step("bootstrap.start_vault").error == "already complete"
     assert statuses(plan, "management_services") == {Status.SUCCESS}
@@ -148,8 +165,66 @@ def test_dry_run_skips_everything_exits_0_and_leaves_state_alone(tmp_path):
 def test_unselected_phases_are_skipped(harness):
     rc, plan = harness.run(run_names={"preflight"})
     assert rc == 0
-    assert harness.executed == ["preflight.yml"]
+    assert harness.executed == [CONFIGURE_VAULT, "preflight.yml"]
     assert plan.get_step("vmware.install_esxi").error == "not selected"
+
+
+def test_configure_vault_runs_first_and_its_failure_stops_the_run(harness):
+    harness.fail_on.add(CONFIGURE_VAULT)
+    rc, plan = harness.run()
+
+    assert rc == 1
+    assert harness.executed == [CONFIGURE_VAULT]
+    assert plan.get_step(CONFIGURE_VAULT_STEP_ID).status == Status.FAILED
+    assert statuses(plan, "preflight") == {Status.PENDING}
+    assert harness.phase_status("preflight") == PhaseStatus.PENDING
+
+
+def test_configure_vault_runs_again_on_resume(harness):
+    harness.run(run_names={"preflight"})
+    harness.executed.clear()
+    harness.run(run_names={"preflight"})
+    assert harness.executed == [CONFIGURE_VAULT]
+
+
+def test_retired_local_services_skip_configure_vault(harness):
+    harness.local_services = None
+    rc, plan = harness.run()
+
+    assert rc == 0
+    assert CONFIGURE_VAULT not in harness.executed
+    assert plan.get_step(CONFIGURE_VAULT_STEP_ID).error == "local services retired"
+
+
+def test_hub_services_completion_switches_vault_and_retires_local_services(harness, monkeypatch):
+    harness.hub_vault_addr = "https://vault.hub"
+    services = harness.local_services
+    switched_at = []
+    original = AnsibleRunner.switch_vault_addr
+
+    def record_switch(runner, addr):
+        switched_at.append(len(harness.executed))
+        original(runner, addr)
+
+    monkeypatch.setattr(AnsibleRunner, "switch_vault_addr", record_switch)
+    rc, _ = harness.run()
+
+    assert rc == 0
+    # After the last hub_services playbook, before the first spoke_clusters one.
+    assert harness.executed[switched_at[0] - 1].startswith("hub_services/")
+    assert harness.runner.vault_addr == "https://vault.hub"
+    assert harness.runner.vault_credentials_file is None
+    assert services.stopped
+
+
+def test_failed_hub_services_keeps_local_services(harness):
+    harness.hub_vault_addr = "https://vault.hub"
+    harness.fail_on.add("hub_services/install_operators.yml")
+    rc, _ = harness.run()
+
+    assert rc == 1
+    assert harness.runner.vault_addr == "http://vault:8200"
+    assert not harness.local_services.stopped
 
 
 def test_failed_health_check_exits_1(harness, monkeypatch):

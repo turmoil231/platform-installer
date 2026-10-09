@@ -1,0 +1,38 @@
+# packaging/Containerfile.hauler
+#
+# Builds the Hauler image: the only container image shipped next to the
+# platform-installer binary. At deploy time the installer loads the haul
+# into a store with it and serves the haul's images and files
+# (installer/runner/services.py). Every other image — including the Ansible
+# execution image — is pulled from the haul through it.
+#
+# The hauler binary is staged into the build context by
+# packaging/build_hauler_image.sh (--hauler-binary); nothing is downloaded
+# during the build.
+#
+# Build:
+#   ./packaging/build_hauler_image.sh --hauler-binary /path/to/hauler
+#
+# The resulting image is saved as:
+#   dist/platform-hauler-<VERSION>-container.tar.gz
+
+ARG RHEL_VERSION=9.4
+FROM registry.access.redhat.com/ubi9/ubi-minimal:${RHEL_VERSION}
+
+ARG VERSION=dev
+ARG BUILD_DATE
+ARG GIT_COMMIT
+
+LABEL name="platform-hauler"                                        \
+      version="${VERSION}"                                          \
+      build-date="${BUILD_DATE}"                                    \
+      git-commit="${GIT_COMMIT}"                                    \
+      description="Rancher Hauler for platform-installer"          \
+      maintainer="platform-ops@example.internal"
+
+COPY .build-hauler/hauler /usr/local/bin/hauler
+
+RUN chmod 0755 /usr/local/bin/hauler && hauler version
+
+# ── No ENTRYPOINT / CMD ────────────────────────────────────────────────────────
+# The installer runs `hauler store load|serve ...` explicitly.

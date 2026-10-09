@@ -1615,13 +1615,44 @@ vdi_services:
 
 
 ##############################################################################
+# LOCAL SERVICES (admin host)
+# Hauler (serving the haul's images and files) and Vault run as containers on
+# the admin host from the start of a deploy until hub_services has migrated
+# them to the hub cluster. Everything here is optional; defaults shown.
+##############################################################################
+
+local_services:
+  # Routable admin-host address BMCs/ESXi hosts use to reach Hauler's
+  # fileserver (Redfish virtual media ISOs). Exposed to playbooks as
+  # platform_hauler.fileserver_url.
+  advertise_address: "10.0.0.10"
+  hauler:
+    bind_address:    "0.0.0.0"
+    registry_port:   5000
+    fileserver_port: 8080
+  vault:
+    # Image reference as Hauler serves it. Default: platform-manifest.yaml
+    # image_pins.vault.source without its registry host.
+    # image: "hashicorp/vault:1.16.3"
+    bind_address: "127.0.0.1"
+    port:         8200
+    # Written by ansible/playbooks/local/configure_vault.yml. Relative paths
+    # resolve against --state-dir. Keep them in a directory of their own: it
+    # is bind-mounted read-write into the Ansible execution container.
+    init_output_path:         "vault-credentials/init.json"
+    approle_credentials_path: "vault-credentials/approle.json"
+
+
+##############################################################################
 # SECRETS BACKEND
 ##############################################################################
 
 secrets:
   backend: "vault"
   vault:
-    bootstrap_addr: "https://bootstrap.mgmt.example.internal:8200"
+    # Until hub_services completes, playbooks use the admin host's local
+    # Vault (local_services.vault) with the AppRole credentials from
+    # local_services.vault.approle_credentials_path. After, they use the hub.
     hub_addr:       "https://vault.apps.hub.example.internal"
     auth_method: "approle"
     role_id_env:   "VAULT_ROLE_ID"

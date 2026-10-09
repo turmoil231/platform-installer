@@ -3,6 +3,7 @@
 # Build output
 dist/
 .build-binary/
+.build-hauler/
 
 # Python
 __pycache__/

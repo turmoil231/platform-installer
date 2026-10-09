@@ -6,6 +6,11 @@ Ansible itself executes inside a preloaded "Ansible execution image" via
 ansible-runner's container executor (see installer/runner/ansible.py).
 Collections are baked into that image ahead of time — the installer never
 stages, validates, or otherwise concerns itself with collections at all.
+
+The execution image ships inside the haul. Before anything else, `deploy`
+starts Hauler (the only image shipped next to the binary) and the admin
+host's Vault, pulling both the execution image and Vault from Hauler's
+registry (see installer/runner/services.py).
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from rich import box
 from installer import tui
 from installer.config.loader import ConfigLoader, ConfigValidationError
 from installer.runner.ansible import AnsibleRunner
+from installer.runner.services import LocalServices, hauler_ref
 from installer.state.store import PhaseStatus, StateStore
 from installer.phases.base import ALL_PHASES, PHASE_NAMES, Phase
 
@@ -61,12 +67,53 @@ def _ansible_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "ansible"
 
 
-def _default_ansible_image() -> str:
+def _installer_version() -> str:
     try:
-        v = version("platform-installer")
+        return version("platform-installer")
     except PackageNotFoundError:
-        v = "dev"
-    return f"platform-ansible-exec:{v}"
+        return "dev"
+
+
+def _default_ansible_image() -> str:
+    return f"platform-ansible-exec:{_installer_version()}"
+
+
+def _default_hauler_image() -> str:
+    return f"platform-hauler:{_installer_version()}"
+
+
+def _local_vault_image(loader: ConfigLoader) -> str:
+    """local_services.vault.image, else the manifest's Vault pin as Hauler serves it."""
+    configured = loader.config.local_services.vault.image  # type: ignore[union-attr]
+    if configured:
+        return configured
+    source = loader.manifest.get("image_pins", {}).get("vault", {}).get("source", "")
+    if not source:
+        console.print(
+            "[bold red]CONFIG ERROR:[/bold red] set local_services.vault.image, or "
+            "image_pins.vault.source in platform-manifest.yaml"
+        )
+        sys.exit(1)
+    return hauler_ref(source)
+
+
+def _make_local_services(
+    loader:            ConfigLoader,
+    state_dir:         Path,
+    haul_path:         Path,
+    hauler_image:      str,
+    exec_image:        str,
+    container_runtime: str | None,
+) -> LocalServices:
+    return LocalServices(
+        state_dir         = state_dir,
+        haul_path         = haul_path,
+        config            = loader.config.local_services,  # type: ignore[union-attr]
+        hauler_image      = hauler_image,
+        exec_image        = exec_image,
+        vault_image       = _local_vault_image(loader),
+        container_runtime = container_runtime,
+    )
 
 
 def _build_host_mounts(loader: ConfigLoader) -> list[tuple[Path, bool]]:
@@ -91,8 +138,15 @@ def _make_runner(
     container_image:   str,
     container_runtime: str | None,
     haul_path:         Path,
+    services:          LocalServices,
+    hub_vault_addr:    str | None,
     dry_run:           bool,
 ) -> AnsibleRunner:
+    """
+    `hub_vault_addr` is set when the local services have been retired (a
+    previous run completed hub_services): playbooks then talk to the hub's
+    Vault from the start.
+    """
     ansible_dir      = _ansible_dir()
     private_data_dir = state_dir / "ansible-pdd"
 
@@ -106,13 +160,15 @@ def _make_runner(
     vars_dir.mkdir(parents=True, exist_ok=True)
     with (vars_dir / "haul.yml").open("w") as fh:
         yaml.dump({"platform_haul_path": str(haul_path)}, fh)
+    with (vars_dir / "local_services.yml").open("w") as fh:
+        yaml.dump(services.ansible_vars(), fh)
 
     automation = loader.config.global_.automation  # type: ignore[union-attr]
     secrets    = loader._raw_config.get("secrets", {}).get("vault", {})
-    vault_addr = secrets.get("bootstrap_addr", "http://localhost:8200")
 
     host_mounts = _build_host_mounts(loader)
     host_mounts.append((haul_path, True))
+    host_mounts += [(d, False) for d in services.credential_dirs()]
 
     return AnsibleRunner(
         ansible_dir          = ansible_dir,
@@ -120,9 +176,10 @@ def _make_runner(
         container_image      = container_image,
         container_runtime    = container_runtime,
         host_mounts          = host_mounts,
-        vault_addr           = vault_addr,
+        vault_addr           = hub_vault_addr or services.vault_addr,
         vault_role_id_env    = secrets.get("role_id_env",   "VAULT_ROLE_ID"),
         vault_secret_id_env  = secrets.get("secret_id_env", "VAULT_SECRET_ID"),
+        vault_credentials_file = None if hub_vault_addr else services.approle_credentials_path,
         max_retries          = automation.max_retries,
         retry_delay          = automation.retry_delay_seconds,
         dry_run              = dry_run,
@@ -138,14 +195,26 @@ def _instantiate_phases(runner: AnsibleRunner, store: StateStore, loader: Config
     return [Cls(runner=runner, store=store, config_vars=merged) for Cls in ALL_PHASES]
 
 
+#: Runs at the start of every deploy, outside the state store: it must be
+#: idempotent (initialize if needed, unseal if sealed, ensure the AppRole),
+#: because the local Vault comes back sealed after every container restart.
+LOCAL_SERVICES          = "local_services"
+CONFIGURE_VAULT         = "local/configure_vault.yml"
+CONFIGURE_VAULT_STEP_ID = f"{LOCAL_SERVICES}.configure_vault"
+
+
 def build_plan(phases: list[Phase]) -> tui.InstallPlan:
     """
-    Progress-UI plan: one tui.Phase per installer phase, one tui.Step per
-    planned playbook plus a health-check step for phases that have one.
-    Phases that won't run are still in the plan (and skipped by install()),
-    so the operator sees the whole deployment.
+    Progress-UI plan: the always-run local_services step, then one tui.Phase
+    per installer phase, one tui.Step per planned playbook plus a
+    health-check step for phases that have one. Phases that won't run are
+    still in the plan (and skipped by install()), so the operator sees the
+    whole deployment.
     """
     plan = tui.InstallPlan()
+    plan.phases.append(tui.Phase(id=LOCAL_SERVICES, name=LOCAL_SERVICES, steps=[
+        tui.Step(id=CONFIGURE_VAULT_STEP_ID, name=CONFIGURE_VAULT, phase_id=LOCAL_SERVICES),
+    ]))
     for p in phases:
         ui_phase = tui.Phase(id=p.name, name=p.name)
         for pb in p.planned_playbooks():
@@ -182,11 +251,17 @@ def make_install(
     checkpoints:        set[str],
     confirm:            Callable[[str], bool],
     hub_vault_addr:     str,
+    local_services:     LocalServices | None,
     dry_run:            bool,
     skip_health_checks: bool,
 ):
     """
     Build the install(reporter) function that run_installer() drives.
+
+    `local_services` is None once they've been retired (hub_services
+    completed on an earlier run). Otherwise configure_vault.yml runs first,
+    and when hub_services completes the runner switches to the hub's Vault
+    and the local containers are removed.
 
     Nothing in here may print, prompt (except through `confirm`, only ever
     a real prompt in plain mode at an interactive terminal), or sys.exit():
@@ -204,6 +279,19 @@ def make_install(
             for step_id in steps_by_phase[p.name]:
                 reporter.skip_step(step_id, reason=reason)
 
+        if local_services is None:
+            reporter.skip_step(CONFIGURE_VAULT_STEP_ID, reason="local services retired")
+        else:
+            try:
+                result = runner.run_playbook(CONFIGURE_VAULT, step_id=CONFIGURE_VAULT_STEP_ID)
+            except Exception as exc:
+                # The runner has already finished the step that raised.
+                reporter.log(f"Local Vault configuration raised: {exc}", level="error")
+                return
+            if not result.success:
+                reporter.log("Local Vault configuration FAILED", level="error")
+                return
+
         for p in phases:
             if p.name not in run_names:
                 skip_phase(p, "not selected")
@@ -218,10 +306,6 @@ def make_install(
             if gate and not confirm(f"Checkpoint {gate}: continue with '{p.name}'?"):
                 reporter.log(f"Stopped at approval checkpoint {gate} before {p.name}", level="warning")
                 return
-
-            # Switch Vault to hub address after hub_services completes
-            if p.name == "hub_services" and hub_vault_addr:
-                runner.switch_vault_addr(hub_vault_addr)
 
             reporter.log(f"Phase {p.name}")
 
@@ -265,6 +349,16 @@ def make_install(
 
                 ctx.complete(message=result.message)
                 reporter.log(f"{p.name}: {result.message}")
+
+            # hub_services migrated the local Vault and Hauler content to the
+            # hub: switch over and retire the admin host's containers.
+            if p.name == "hub_services" and hub_vault_addr and local_services is not None:
+                runner.switch_vault_addr(hub_vault_addr)
+                try:
+                    local_services.stop()
+                    reporter.log("Local Hauler and Vault containers removed")
+                except Exception as exc:
+                    reporter.log(f"Could not remove local Hauler/Vault containers: {exc}", level="warning")
 
     return install
 
@@ -393,8 +487,11 @@ def _progress_options(f):
               help="Path to the Rancher Hauler bundle (.tar.zst) containing "
                    "all staged deployment assets.")
 @click.option("--ansible-image",                  default=None,
-              help="Tag of the preloaded Ansible execution image "
-                   "(default: platform-ansible-exec:<installer version>).")
+              help="Ansible execution image reference inside the haul, as served by "
+                   "Hauler's registry (default: platform-ansible-exec:<installer version>).")
+@click.option("--hauler-image",                   default=None,
+              help="Tag of the Hauler image, auto-loaded from a tarball next to the binary "
+                   "(default: platform-hauler:<installer version>).")
 @click.option("--container-runtime",              default=None,
               help="podman or docker. Auto-detected (podman preferred) if not set.")
 @click.option("--phase",                    "-p", default=None)
@@ -405,7 +502,7 @@ def _progress_options(f):
 @click.option("--auto-approve",                   is_flag=True, default=False)
 @_progress_options
 def deploy(
-    config, manifest, state_dir, haul_path, ansible_image, container_runtime,
+    config, manifest, state_dir, haul_path, ansible_image, hauler_image, container_runtime,
     phase, from_phase, to_phase, dry_run, skip_health_checks,
     auto_approve, ui, junit, log_file, exit_when_done,
 ):
@@ -419,40 +516,53 @@ def deploy(
     store = StateStore(state_path / "state.db")
     store.initialize(PHASE_NAMES)
 
-    runner = _make_runner(
-        loader=loader, state_dir=state_path,
-        container_image=ansible_image or _default_ansible_image(),
-        container_runtime=container_runtime,
-        haul_path=haul_path,
-        dry_run=dry_run,
-    )
-    phases        = _instantiate_phases(runner, store, loader)
-    phase_by_name = {p.name: p for p in phases}
-
-    # Determine run list
+    # Determine run list (before anything reads phase state: --from-phase
+    # resets phases, which decides whether the local services are retired)
     if phase:
-        if phase not in phase_by_name:
+        if phase not in PHASE_NAMES:
             console.print(f"[red]Unknown phase: {phase!r}[/red]  Valid: {PHASE_NAMES}")
             sys.exit(1)
-        run_list = [phase_by_name[phase]]
+        run_names_ordered = [phase]
     else:
-        run_list = list(phases)
+        run_names_ordered = list(PHASE_NAMES)
         if from_phase:
-            idx = next((i for i, p in enumerate(run_list) if p.name == from_phase), None)
-            if idx is None:
+            if from_phase not in run_names_ordered:
                 console.print(f"[red]Unknown --from-phase: {from_phase!r}[/red]")
                 sys.exit(1)
+            run_names_ordered = run_names_ordered[run_names_ordered.index(from_phase):]
             if not dry_run:
-                for p in run_list[idx:]:
-                    store.reset_phase(p.name)
-            run_list = run_list[idx:]
+                for name in run_names_ordered:
+                    store.reset_phase(name)
         if to_phase:
-            idx = next((i for i, p in enumerate(run_list) if p.name == to_phase), None)
-            if idx is None:
+            if to_phase not in run_names_ordered:
                 console.print(f"[red]Unknown --to-phase: {to_phase!r}[/red]")
                 sys.exit(1)
-            run_list = run_list[:idx + 1]
-    run_names = {p.name for p in run_list}
+            run_names_ordered = run_names_ordered[:run_names_ordered.index(to_phase) + 1]
+    run_names = set(run_names_ordered)
+
+    # Once hub_services has migrated Vault (and Hauler's content) to the hub,
+    # the admin host's Hauler and Vault are retired for good.
+    secrets        = loader._raw_config.get("secrets", {}).get("vault", {})
+    hub_vault_addr = secrets.get("hub_addr", "")
+    hub_record     = store.get_phase("hub_services")
+    retired        = bool(hub_vault_addr and hub_record and hub_record.is_complete)
+
+    exec_image = ansible_image or _default_ansible_image()
+    services = _make_local_services(
+        loader=loader, state_dir=state_path, haul_path=haul_path,
+        hauler_image=hauler_image or _default_hauler_image(),
+        exec_image=exec_image, container_runtime=container_runtime,
+    )
+    runner = _make_runner(
+        loader=loader, state_dir=state_path,
+        container_image=exec_image,
+        container_runtime=container_runtime,
+        haul_path=haul_path,
+        services=services,
+        hub_vault_addr=hub_vault_addr if retired else None,
+        dry_run=dry_run,
+    )
+    phases = _instantiate_phases(runner, store, loader)
 
     automation  = loader.config.global_.automation  # type: ignore[union-attr]
     fully_auto  = automation.fully_automated or auto_approve
@@ -462,9 +572,9 @@ def deploy(
     # Checkpoints can only be answered in plain mode at an interactive
     # terminal: the dashboard owns the terminal, and in CI nobody can answer.
     gates = []
-    for p in run_list:
-        record = store.get_phase(p.name)
-        gate   = checkpoint_before(p.name, checkpoints)
+    for name in run_names_ordered:
+        record = store.get_phase(name)
+        gate   = checkpoint_before(name, checkpoints)
         if gate and not (record and record.is_complete):
             gates.append(gate)
     if gates and (mode == "tui" or not sys.stdin.isatty()):
@@ -476,22 +586,24 @@ def deploy(
         )
         sys.exit(1)
 
-    # Image loading prints progress and can take minutes: finish it before
-    # the dashboard takes over the terminal.
+    # Loading the haul and pulling images prints progress and can take a
+    # long time: finish it before the dashboard takes over the terminal.
     if not dry_run:
         try:
+            if not retired:
+                services.ensure_running()
             runner.ensure_ready()
         except RuntimeError as exc:
-            console.print(f"[bold red]ANSIBLE IMAGE ERROR:[/bold red] {exc}")
+            console.print(f"[bold red]STARTUP ERROR:[/bold red] {exc}")
             sys.exit(1)
 
-    secrets = loader._raw_config.get("secrets", {}).get("vault", {})
     plan    = build_plan(phases)
     install = make_install(
         plan=plan, phases=phases, run_names=run_names, store=store, runner=runner,
         checkpoints=checkpoints,
         confirm=lambda question: click.confirm(question, default=False),
-        hub_vault_addr=secrets.get("hub_addr", ""),
+        hub_vault_addr=hub_vault_addr,
+        local_services=None if retired else services,
         dry_run=dry_run, skip_health_checks=skip_health_checks,
     )
     sys.exit(tui.run_installer(
@@ -514,11 +626,12 @@ def deploy(
               help="Path to the Rancher Hauler bundle (.tar.zst) containing "
                    "all staged deployment assets.")
 @click.option("--ansible-image",            default=None)
+@click.option("--hauler-image",             default=None)
 @click.option("--container-runtime",        default=None)
 @click.option("--dry-run",                  is_flag=True, default=False)
 @_progress_options
 def preflight(
-    config, manifest, state_dir, haul_path, ansible_image, container_runtime, dry_run,
+    config, manifest, state_dir, haul_path, ansible_image, hauler_image, container_runtime, dry_run,
     ui, junit, log_file, exit_when_done,
 ):
     """Run preflight checks only."""
@@ -526,7 +639,8 @@ def preflight(
     ctx.invoke(
         deploy,
         config=config, manifest=manifest, state_dir=state_dir,
-        haul_path=haul_path, ansible_image=ansible_image, container_runtime=container_runtime,
+        haul_path=haul_path, ansible_image=ansible_image, hauler_image=hauler_image,
+        container_runtime=container_runtime,
         phase="preflight", dry_run=dry_run, skip_health_checks=False,
         auto_approve=True, from_phase=None, to_phase=None,
         ui=ui, junit=junit, log_file=log_file, exit_when_done=exit_when_done,

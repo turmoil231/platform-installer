@@ -14,6 +14,12 @@ Execution model (containerized):
   `podman run --rm <image> ansible-playbook ...` (or docker) and streams
   events back the same way it does for local execution.
 
+  The execution image ships inside the haul. LocalServices
+  (installer/runner/services.py) pulls it from Hauler's registry into the
+  local image store before the first playbook runs. Execution containers
+  use host networking so they reach the admin host's Hauler and Vault on
+  loopback.
+
   Collections are baked into the execution image at build time
   (scripts/stage_collections.sh + packaging/build_ansible_image.sh). Nothing
   on the host installs or references collections at deploy time.
@@ -98,24 +104,29 @@ def _binary_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def image_present(image_tag: str, runtime: str) -> bool:
+    inspect = subprocess.run(
+        [runtime, "image", "inspect", image_tag],
+        capture_output=True, text=True,
+    )
+    return inspect.returncode == 0
+
+
 def ensure_image_loaded(
-    image_tag: str,
-    runtime:   str,
+    image_tag:  str,
+    runtime:    str,
+    smoke_cmd:  list[str],
     search_dir: Path | None = None,
 ) -> None:
     """
     Make sure `image_tag` is present in the local podman/docker image store.
     If it isn't, look for a colocated tarball next to the running binary,
-    verify its checksum, load it, and smoke-test it.
+    verify its checksum, load it, and smoke-test it by running `smoke_cmd`.
     """
-    inspect = subprocess.run(
-        [runtime, "image", "inspect", image_tag],
-        capture_output=True, text=True,
-    )
-    if inspect.returncode == 0:
+    if image_present(image_tag, runtime):
         return
 
-    console.print(f"  [yellow]Ansible execution image not found locally — loading {image_tag}[/yellow]")
+    console.print(f"  [yellow]{image_tag} not found locally — loading it[/yellow]")
 
     search_dir = search_dir or _binary_dir()
     image_name = image_tag.split(":", 1)[0]
@@ -147,7 +158,7 @@ def ensure_image_loaded(
         raise RuntimeError(f"{runtime} load failed:\n{load.stderr}")
 
     smoke = subprocess.run(
-        [runtime, "run", "--rm", image_tag, "ansible-playbook", "--version"],
+        [runtime, "run", "--rm", image_tag, *smoke_cmd],
         capture_output=True, text=True,
     )
     if smoke.returncode != 0:
@@ -196,8 +207,9 @@ class AnsibleRunner:
         a single `deploy` invocation.
 
     container_image:
-        Tag of the preloaded Ansible execution image
-        (e.g. platform-ansible-exec:2025.1.0).
+        Tag of the Ansible execution image (e.g. platform-ansible-exec:2025.1.0).
+        Must already be in the local image store: LocalServices pulls it
+        from the haul.
 
     container_runtime:
         "podman" or "docker". Auto-detected (podman preferred) if not given.
@@ -205,14 +217,23 @@ class AnsibleRunner:
     host_mounts:
         External, user-provided host paths that must be visible inside the
         execution container but are NOT copied into private_data_dir (SSH
-        keypair, internal CA cert/key, pull secret, the Hauler haul bundle).
+        keypair, internal CA cert/key, pull secret, the Hauler haul bundle,
+        the directories configure_vault.yml writes credentials into).
         Each entry is (path, read_only). Mounted at the identical path
         inside the container, so extravars values referencing these paths
         (e.g. global.ssh.private_key_path) stay valid on both sides with no
         translation needed.
 
     vault_addr:
-        Active Vault address (bootstrap during early phases, hub later).
+        Active Vault address (the admin host's local Vault until
+        hub_services completes, the hub's after).
+
+    vault_credentials_file:
+        JSON or YAML file with `role_id` and `secret_id`, written by
+        configure_vault.yml for the local Vault. While set and present, it
+        supplies VAULT_ROLE_ID/VAULT_SECRET_ID; otherwise they come from the
+        `vault_role_id_env`/`vault_secret_id_env` environment variables.
+        Read before every playbook run, since it's created mid-deploy.
 
     reporter:
         Progress reporter (installer.tui.Reporter) that every playbook run
@@ -228,6 +249,7 @@ class AnsibleRunner:
         vault_addr:           str,
         vault_role_id_env:    str = "VAULT_ROLE_ID",
         vault_secret_id_env:  str = "VAULT_SECRET_ID",
+        vault_credentials_file: str | Path | None = None,
         container_runtime:    str | None = None,
         host_mounts:          list[tuple[str | Path, bool]] | None = None,
         max_retries:          int = 3,
@@ -242,6 +264,7 @@ class AnsibleRunner:
         self.vault_addr          = vault_addr
         self.vault_role_id_env   = vault_role_id_env
         self.vault_secret_id_env = vault_secret_id_env
+        self.vault_credentials_file = Path(vault_credentials_file) if vault_credentials_file else None
         self.max_retries         = max_retries
         self.retry_delay         = retry_delay
         self.dry_run             = dry_run
@@ -253,22 +276,29 @@ class AnsibleRunner:
         self.container_runtime: str | None = None
 
     def ensure_ready(self) -> None:
-        """Verify (and auto-load if needed) the Ansible execution image. Idempotent."""
+        """Verify the Ansible execution image is in the local image store. Idempotent."""
         if self._image_ready or self.dry_run:
             return
         self.container_runtime = self.container_runtime or detect_container_runtime(
             self._container_runtime_override
         )
-        ensure_image_loaded(self.container_image, self.container_runtime)
+        if not image_present(self.container_image, self.container_runtime):
+            raise RuntimeError(
+                f"Ansible execution image {self.container_image!r} is not in the local "
+                f"{self.container_runtime} image store. It is pulled from the haul's Hauler "
+                f"registry at startup; check that the haul contains it under that reference."
+            )
         self._image_ready = True
 
     def switch_vault_addr(self, new_addr: str) -> None:
         """
-        Switch the active Vault address.  Called by hub_services phase after
-        Vault migration from bootstrap → hub is confirmed healthy.
+        Switch the active Vault address. Called once hub_services (which
+        migrates the local Vault to the hub) completes. The hub's AppRole
+        credentials come from the environment, not the local credentials file.
         """
         self._reporter().log(f"Switching Vault address: {self.vault_addr} → {new_addr}")
         self.vault_addr = new_addr
+        self.vault_credentials_file = None
 
     def run_playbook(
         self,
@@ -321,6 +351,18 @@ class AnsibleRunner:
         return result
 
     # ── Internal ───────────────────────────────────────────────────────────────
+
+    def _vault_credentials(self) -> tuple[str, str]:
+        """(role_id, secret_id) to pass into the execution container."""
+        path = self.vault_credentials_file
+        if path is not None and path.is_file():
+            with path.open() as fh:
+                creds = yaml.safe_load(fh) or {}
+            return str(creds.get("role_id", "")), str(creds.get("secret_id", ""))
+        return (
+            os.environ.get(self.vault_role_id_env, ""),
+            os.environ.get(self.vault_secret_id_env, ""),
+        )
 
     def _reporter(self) -> "Reporter":
         if self.reporter is None:
@@ -441,10 +483,11 @@ class AnsibleRunner:
             for path, read_only in self.host_mounts
         ]
 
+        role_id, secret_id = self._vault_credentials()
         env_vars = {
             "VAULT_ADDR":                self.vault_addr,
-            "VAULT_ROLE_ID":             os.environ.get(self.vault_role_id_env, ""),
-            "VAULT_SECRET_ID":           os.environ.get(self.vault_secret_id_env, ""),
+            "VAULT_ROLE_ID":             role_id,
+            "VAULT_SECRET_ID":           secret_id,
             "ANSIBLE_FORCE_COLOR":       "1",
             # "default", not "yaml": the yaml callback isn't part of
             # ansible-core — ansible-core redirects the bare name to
@@ -501,6 +544,8 @@ class AnsibleRunner:
             process_isolation_executable  = self.container_runtime,
             container_image               = self.container_image,
             container_volume_mounts       = container_volume_mounts,
+            # Reach the admin host's Hauler and Vault on loopback.
+            container_options             = ["--network=host"],
         )
 
         stats  = runner_obj.stats or {}

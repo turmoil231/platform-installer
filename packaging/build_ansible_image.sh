@@ -13,9 +13,12 @@
 #   dist/platform-ansible-exec-<VERSION>-container.tar.gz
 #   dist/platform-ansible-exec-<VERSION>-container.tar.gz.sha256
 #
-# Transfer both files to the admin server, alongside the compiled binary.
-# The binary auto-loads this image on first run if it isn't already loaded
-# in the local podman/docker store (see AnsibleRunner.ensure_ready()).
+# This image travels inside the haul, not next to the binary: push it
+# (--push-to) to the registry your haul is built from and list it in the
+# Hauler manifest. At deploy time the installer pulls it from Hauler's
+# registry under the reference given by --ansible-image (default
+# platform-ansible-exec:<version>), i.e. the haul reference without its
+# registry host (see LocalServices in installer/runner/services.py).
 #
 # Usage:
 #   ./packaging/build_ansible_image.sh
@@ -158,16 +161,7 @@ echo ""
 echo "  Image tarball:   ${CONTAINER_TARBALL}"
 echo "  Image checksum:  ${CONTAINER_TARBALL}.sha256"
 echo ""
-echo "  Transfer alongside the compiled platform-installer binary"
-echo "  (see packaging/build_binary.sh) to the admin server, same directory:"
-echo ""
-echo "    scp \\"
-echo "      ${CONTAINER_TARBALL} \\"
-echo "      ${CONTAINER_TARBALL}.sha256 \\"
-echo "      dist/platform-installer-${VERSION} \\"
-echo "      admin-server:/opt/platform-installer/"
-echo ""
-echo "  The binary automatically loads this image on first run if it isn't"
-echo "  already present in the local podman/docker store. No manual"
-echo "  '${RUNTIME} load' step required."
+echo "  Add this image to the haul (push with --push-to, then list it in the"
+echo "  Hauler manifest). The installer pulls it from Hauler's registry at"
+echo "  deploy time; it is not shipped next to the binary."
 echo "════════════════════════════════════════════════════════════════"

@@ -144,3 +144,32 @@ def test_event_handler_routes_output_and_captures_last_failure(tmp_path, monkeyp
     assert "Last failed task: check on h3" in error
     assert '"msg": "boom"' in error
     assert "Failed hosts: h3" in error
+
+
+def test_vault_credentials_come_from_the_file_once_written_then_env_after_switch(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_ROLE_ID", "env-role")
+    monkeypatch.setenv("VAULT_SECRET_ID", "env-secret")
+    creds = tmp_path / "approle.json"
+    runner, _ = make_runner(tmp_path, vault_credentials_file=creds)
+
+    assert runner._vault_credentials() == ("env-role", "env-secret")
+
+    creds.write_text('{"role_id": "file-role", "secret_id": "file-secret"}')
+    assert runner._vault_credentials() == ("file-role", "file-secret")
+
+    runner.switch_vault_addr("https://vault.hub")
+    assert runner._vault_credentials() == ("env-role", "env-secret")
+
+
+def test_execution_containers_use_host_networking(tmp_path, monkeypatch):
+    runner, _ = make_runner(tmp_path, max_retries=0)
+    runner._image_ready = True
+    seen = {}
+
+    def fake_run(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(rc=0, status="successful", stats={})
+
+    monkeypatch.setattr(ansible_mod.ansible_runner, "run", fake_run)
+    runner.run_playbook("preflight.yml", step_id=STEP)
+    assert seen["container_options"] == ["--network=host"]

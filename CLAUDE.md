@@ -47,11 +47,25 @@ process-isolation executor (`process_isolation=True`). See
   addressed out of the bundle (`hauler store extract`/`serve`, etc.) is an
   Ansible-role concern, not something the Python installer understands.
 - **Distribution**: a compiled single binary (`platform-installer-<version>`,
-  built by `packaging/build_binary.sh`) + a preloaded Ansible execution image
-  tarball (built by `packaging/build_ansible_image.sh`), transferred together.
-  The binary auto-loads the image into the local podman/docker store on
-  first run if it isn't already present (`AnsibleRunner.ensure_ready()`) —
-  no separate load step, no wrapper script.
+  built by `packaging/build_binary.sh`) + a Hauler image tarball (built by
+  `packaging/build_hauler_image.sh`) + the haul. The Ansible execution image
+  (built by `packaging/build_ansible_image.sh`) travels **inside the haul**.
+  The binary auto-loads the Hauler image from the tarball next to it, then
+  pulls the execution image and Vault from Hauler's registry — no separate
+  load step, no wrapper script.
+- **Local services** (`installer/runner/services.py`): before the dashboard
+  starts, `deploy` runs `LocalServices.ensure_running()` on every invocation:
+  it loads the haul into a Hauler store (once), starts the Hauler registry,
+  fileserver and Vault containers on the admin host if they aren't running,
+  and pulls images from Hauler. This is container state, not phase state, so
+  it's outside the state store. Python only starts the Vault server;
+  `local/configure_vault.yml` (step `local_services.configure_vault`) runs
+  first in every deploy to init/unseal/configure it and writes the AppRole
+  credentials file the runner reads (paths in `local_services.vault`).
+  Execution containers use `--network=host` to reach them on loopback. When
+  `hub_services` completes (it migrates Vault and Artifactory to the hub),
+  `install()` switches to `secrets.vault.hub_addr` and removes the local
+  containers; later deploys don't start them.
 - **Progress reporting goes through `installer.tui.Reporter`.** Phases and
   the Ansible runner report step start/finish/output through a reporter and
   never print directly during a run. `installer.tui.run_installer` picks the
@@ -89,7 +103,8 @@ platform-installer/
 │   ├── phases/
 │   │   └── base.py             # Phase base class + all phase implementations
 │   ├── runner/
-│   │   └── ansible.py          # AnsibleRunner (container executor)
+│   │   ├── ansible.py          # AnsibleRunner (container executor)
+│   │   └── services.py         # LocalServices: Hauler + Vault containers on the admin host
 │   ├── state/
 │   │   └── store.py            # SQLite phase state store
 │   └── tui/                    # Progress UI: Textual dashboard / plain CI log (own CLAUDE.md)
@@ -99,7 +114,9 @@ platform-installer/
 │       └── requirements.yml    # Collection dependency declarations
 ├── packaging/
 │   ├── Containerfile.ansible-exec  # Ansible execution image build (ansible-core + collections)
-│   ├── build_ansible_image.sh      # Builds + saves the Ansible execution image
+│   ├── build_ansible_image.sh      # Builds the Ansible execution image (goes into the haul)
+│   ├── Containerfile.hauler        # Hauler image build (shipped next to the binary)
+│   ├── build_hauler_image.sh       # Builds + saves the Hauler image
 │   ├── build_binary.sh             # PyInstaller build of the compiled CLI binary
 │   └── seed_pip_cache.sh           # Pre-downloads pip wheels for offline builds
 ├── scripts/
@@ -121,6 +138,7 @@ Nothing is written under the `ansible/` source tree at runtime anymore.
 
 | Phase | Python class | Key playbooks |
 |-------|-------------|---------------|
+| local_services (every run, not state-tracked) | — (`cli.make_install`) | local/configure_vault.yml |
 | preflight | PreflightPhase | preflight.yml |
 | vmware | VMwarePhase | vmware/install_esxi.yml, vmware/deploy_vcenter.yml, vmware/configure_vcenter.yml, vmware/configure_storage.yml |
 | bootstrap | BootstrapPhase | bootstrap/deploy_bootstrap_vm.yml, bootstrap/start_vault.yml, bootstrap/start_artifactory.yml, bootstrap/seed_vault.yml, bootstrap/seed_artifactory.yml |
@@ -143,6 +161,9 @@ Nothing is written under the `ansible/` source tree at runtime anymore.
 - `platform_haul_path`: not config-derived — written directly from the
   `--haul-path` CLI flag (see `installer/cli.py::_make_runner`), not through
   `ConfigLoader.generate_ansible_vars()`.
+- `platform_hauler` (`registry`, `fileserver_url`) and `platform_local_vault`
+  (`addr`, `init_output_path`, `approle_credentials_path`): written from
+  `LocalServices.ansible_vars()` into `vars/local_services.yml`.
 - Per-spoke vars: `platform_spoke` (merged defaults + cluster overrides)
 - Secrets: always `vault:secret/path` strings resolved at task time
   via `community.hashi_vault.hashi_vault` lookup
@@ -180,7 +201,9 @@ Required collections:
 - Admin server: RHEL 9, podman installed (docker fallback) — no Python
   required; the installer is a compiled binary
 - All deployments: fully disconnected (no internet access at deploy time)
-- Secrets: HashiCorp Vault (AppRole auth), VAULT_ROLE_ID + VAULT_SECRET_ID env vars
+- Secrets: HashiCorp Vault (AppRole auth). The admin host's local Vault's
+  AppRole credentials come from the file `configure_vault.yml` writes; the
+  hub Vault's from VAULT_ROLE_ID + VAULT_SECRET_ID env vars
 - Container runtime: podman preferred, docker fallback (used to launch the
   Ansible execution image — the installer binary itself never runs containerized)
 - All OCP clusters: RHEL 9 gold images, OCP 4.16

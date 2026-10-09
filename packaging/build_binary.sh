@@ -10,7 +10,9 @@
 # `podman/docker run <ansible-exec-image> ansible-playbook ...`), so no
 # heavy, dynamically-loaded Ansible plugin tree needs to be bundled here.
 # See packaging/build_ansible_image.sh for the separate image that runs
-# Ansible itself.
+# Ansible itself (it travels inside the haul), and
+# packaging/build_hauler_image.sh for the Hauler image shipped next to this
+# binary.
 #
 # Output:
 #   dist/platform-installer-<VERSION>
@@ -155,16 +157,16 @@ echo "  Checksum:  ${BINARY_PATH}.sha256"
 echo "  Size:      $(du -h "${BINARY_PATH}" | cut -f1)"
 echo ""
 echo "  This binary is the entire deploy-host artifact — no venv, no wrapper"
-echo "  script. Pair it with the Ansible execution image tarball built by"
-echo "  packaging/build_ansible_image.sh (same dist/ directory, same"
-echo "  version) and transfer both to the admin server:"
+echo "  script. Pair it with the Hauler image tarball built by"
+echo "  packaging/build_hauler_image.sh (same dist/ directory, same version)"
+echo "  and transfer both, plus the haul, to the admin server:"
 echo ""
 echo "    scp ${BINARY_PATH} ${BINARY_PATH}.sha256 \\"
-echo "        ${DIST_DIR}/platform-ansible-exec-${VERSION}-container.tar.gz* \\"
+echo "        ${DIST_DIR}/platform-hauler-${VERSION}-container.tar.gz* \\"
 echo "        admin-server:/opt/platform-installer/"
 echo ""
 echo "  On the admin server:"
 echo "    sha256sum -c platform-installer-${VERSION}.sha256"
 echo "    chmod +x platform-installer-${VERSION}"
-echo "    ./platform-installer-${VERSION} preflight --config platform-config.yaml"
+echo "    ./platform-installer-${VERSION} preflight --config platform-config.yaml --haul-path haul.tar.zst"
 echo "════════════════════════════════════════════════════════"

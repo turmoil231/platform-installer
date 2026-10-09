@@ -649,6 +649,42 @@ class SecretsConfig(BaseModel):
     vault:    dict[str, Any]
 
 
+# ── Local services (admin host) ────────────────────────────────────────────────
+
+class HaulerServiceConfig(BaseModel):
+    bind_address:    str = "0.0.0.0"
+    registry_port:   int = 5000
+    fileserver_port: int = 8080
+
+
+class LocalVaultConfig(BaseModel):
+    #: Image reference as served by Hauler's registry (no registry host).
+    #: Defaults to manifest image_pins.vault.source with its registry host
+    #: stripped (see installer/cli.py::_local_vault_image).
+    image:        str | None = None
+    bind_address: str = "127.0.0.1"
+    port:         int = 8200
+    #: Where the configure-vault playbook writes Vault's init output (unseal
+    #: keys, root token) and the AppRole credentials (JSON or YAML with
+    #: role_id and secret_id) the installer passes to every later playbook.
+    #: Relative paths resolve against --state-dir.
+    init_output_path:         str = "vault-credentials/init.json"
+    approle_credentials_path: str = "vault-credentials/approle.json"
+
+
+class LocalServicesConfig(BaseModel):
+    """
+    Hauler and Vault containers the installer runs on the admin host from
+    the start of a deploy until hub_services has migrated their data to the
+    hub cluster. See installer/runner/services.py.
+    """
+    #: Routable admin-host address that BMCs and ESXi hosts use to reach
+    #: Hauler's fileserver (e.g. for Redfish virtual media).
+    advertise_address: str | None = None
+    hauler:            HaulerServiceConfig = HaulerServiceConfig()
+    vault:             LocalVaultConfig = LocalVaultConfig()
+
+
 # ── Preflight ──────────────────────────────────────────────────────────────────
 
 class PreflightCheck(BaseModel):
@@ -678,6 +714,7 @@ class PlatformConfig(BaseModel):
     hub_services:      HubServicesConfig
     spoke_clusters:    SpokeClustersConfig
     vdi_services:      VDIServicesConfig = VDIServicesConfig()
+    local_services:    LocalServicesConfig = LocalServicesConfig()
     secrets:           SecretsConfig
     preflight:         PreflightConfig
 
