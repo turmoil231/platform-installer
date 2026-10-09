@@ -5,7 +5,7 @@
 A Python CLI application that orchestrates a fully automated, disconnected
 (air-gapped) enterprise platform deployment. It reads `platform-config.yaml`
 and `platform-manifest.yaml`, validates them, generates Ansible inventory and
-group_vars, then executes a series of phases by calling Ansible playbooks
+extra-vars, then executes a series of phases by calling Ansible playbooks
 through ansible-runner.
 
 The installer itself is a PyInstaller-compiled single binary that runs
@@ -36,16 +36,18 @@ process-isolation executor (`process_isolation=True`). See
   an `--ansible-image` tag and runs it; it never inspects, validates, or
   installs collections itself.
 - **Two-file config model**: `platform-config.yaml` (topology/intent) +
-  `platform-manifest.yaml` (all version pins and checksums).
+  `platform-manifest.yaml` (all version pins and checksums). The config
+  stays a single file: splitting it into a directory of files (global /
+  inventory / services) was implemented and deliberately rejected.
 - **Staged assets travel as a single Rancher Hauler bundle** (`.tar.zst`),
   located via the required `--haul-path` flag on `deploy`/`preflight` — not a
   config field. `platform-config.yaml` has no `assets` section at all; there
   is no directory-tree-of-pre-staged-files model anymore (gold images, ISOs,
   container images, Helm charts, OLM catalogs, git bundles are all inside the
-  haul). The path is bind-mounted into the Ansible execution container and
-  exposed to playbooks as `platform_haul_path`. How individual assets get
-  addressed out of the bundle (`hauler store extract`/`serve`, etc.) is an
-  Ansible-role concern, not something the Python installer understands.
+  haul). The installer loads it into a Hauler store and serves it (see
+  **Local services**): playbooks reach images at `platform_hauler.registry`
+  and files at `platform_hauler.fileserver_url`. The haul file itself is
+  also bind-mounted into the execution container as `platform_haul_path`.
 - **Distribution**: a compiled single binary (`platform-installer-<version>`,
   built by `packaging/build_binary.sh`) + a Hauler image tarball (built by
   `packaging/build_hauler_image.sh`) + the haul. The Ansible execution image
@@ -84,8 +86,10 @@ process-isolation executor (`process_isolation=True`). See
 - **`AnsibleRunner.reporter`** is attached by `install()`. `run_playbook()`
   takes a `step_id` and reports one step per playbook: retries are output
   lines, and the failure detail is the failed hosts plus the last failed
-  task's result. `deploy` calls `runner.ensure_ready()` (image auto-load, which
-  prints) before the dashboard starts.
+  task's result. `deploy` calls `services.ensure_running()` (Hauler image
+  load, haul load, container starts, image pulls — all of which print) and
+  then `runner.ensure_ready()` (checks the execution image is present)
+  before the dashboard starts.
 - **Approval checkpoints** (`pre_<phase>` / `post_<phase>`) are prompted only
   in `--ui plain` at an interactive terminal. Otherwise `deploy` refuses to
   start unless `--auto-approve`/`fully_automated` is set.
@@ -166,6 +170,11 @@ Nothing is written under the `ansible/` source tree at runtime anymore.
   `LocalServices.ansible_vars()` into `vars/local_services.yml`.
 - Spokes: `platform_spoke_clusters` — `defaults` plus `clusters`, each cluster
   already merged over the defaults (dicts merge, lists and scalars replace)
+- Every generated var reaches every playbook as `--extra-vars` (there's no
+  per-phase scoping, and `vars/` is not Ansible group_vars). Extra-vars beat
+  every other precedence level, so roles and `set_fact` can't override them.
+  Var names must be unique across the generated files: `_load_extra_vars`
+  merges them into one dict.
 - Secrets: always `vault:secret/path` strings resolved at task time
   via `community.hashi_vault.hashi_vault` lookup
 
@@ -189,13 +198,55 @@ Required collections:
 
 ## What needs to be built (priority order)
 
-1. **Tests** — `tests/unit/` for config loader, models, state store
-2. **Playbooks** — stub playbooks for each phase (thin — they import_role from collections)
-3. **Ansible collection: platform.vmware** — ESXi install via Redfish, vCenter OVA deploy, dvSwitch, iSCSI
-4. **Ansible collection: platform.bootstrap** — bootstrap VM deploy, Vault/Artifactory containers
-5. **Ansible collection: platform.idm** — IDM install, LDAP config, DNS records
-6. **Vault policies** — HCL files in vault-policies/
-7. **GitLab CI pipeline** — `.gitlab-ci.yml` for building and publishing
+1. **`local/configure_vault.yml`** — currently a stub that fails, and it runs
+   first in every deploy (including `preflight`), so nothing deploys until
+   it imports the operator's existing Vault configuration collection. See
+   the playbook header for the vars it gets and the files it must write.
+2. **Tests** — loader tests cover spoke var generation only (see the TODO
+   in `tests/unit/config/test_loader.py`); `test_models.py` is a placeholder.
+   CLI install loop, runner, local services, phases and state store are covered.
+3. **Playbooks** — every playbook except `preflight.yml` and
+   `vmware/install_esxi.yml` (the reference calling pattern) is a stub that
+   fails (thin — they import_role from collections)
+4. **Ansible collection: platform.vmware** — ESXi install via Redfish, vCenter OVA deploy, dvSwitch, iSCSI
+5. **Ansible collection: platform.bootstrap** — bootstrap VM deploy, Vault/Artifactory containers
+6. **Ansible collection: platform.idm** — IDM install, LDAP config, DNS records
+7. **Vault policies** — HCL files in vault-policies/
+8. **GitLab CI pipeline** — `.gitlab-ci.yml` tests, builds and publishes the
+   binary and the execution image, but has no job for the Hauler image
+   (`packaging/build_hauler_image.sh`, which needs a staged hauler binary),
+   and still publishes the execution image as a standalone artifact rather
+   than into the haul.
+
+## Open questions and unverified assumptions
+
+Nothing in the Hauler/local-Vault startup has run against real podman or a
+real haul yet — it's covered by unit tests with a faked container runtime.
+
+- **Hauler CLI flags** in `installer/runner/services.py` (`store load
+  --filename`, `store serve registry|fileserver --port`, `--store`) were
+  written from memory. Verify against the Hauler version being shipped.
+- **Image references inside the haul.** `hauler_ref()` assumes Hauler serves
+  `docker.io/hashicorp/vault:1.16.3` as `hashicorp/vault:1.16.3`. Confirm with
+  `hauler store info`; `local_services.vault.image` and `--ansible-image`
+  override it.
+- **The execution image must be added to the haul** (push it with
+  `build_ansible_image.sh --push-to`, list it in the Hauler manifest).
+- **BootstrapPhase overlaps with local services.** It still starts Vault and
+  Artifactory on a bootstrap VM, and its health check polls them. Undecided
+  whether those steps (and the bootstrap VM) are still needed now that the
+  admin host runs Vault and Hauler. `migrate_vault.yml` /
+  `migrate_artifactory.yml` should read from the admin host's Vault and
+  Hauler (`platform_local_vault`, `platform_hauler`).
+- **Hub Vault credentials.** After `hub_services`, the runner takes AppRole
+  credentials for the hub Vault from `VAULT_ROLE_ID`/`VAULT_SECRET_ID` in the
+  environment — but that Vault is created mid-run by the installer, so the
+  operator can't know them at start. Needs a design (e.g. `migrate_vault.yml`
+  writes them to a file like the local AppRole file).
+- **Local Vault has TLS disabled.** It listens on `127.0.0.1` only.
+- **Containers run rootless under podman.** Vault's entrypoint chowns its
+  data dir to a subuid, so the operator may need `podman unshare` to delete
+  `<state-dir>/local-services/vault/`.
 
 ## Environment assumptions
 

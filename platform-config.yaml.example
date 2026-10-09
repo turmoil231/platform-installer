@@ -28,24 +28,24 @@
 #
 #   vdi_services:         VDI stack.  vSphere pool today, OCP Virt tomorrow.
 #
-# Deployment phases
+# Deployment phases (installer/phases/base.py ALL_PHASES)
 # ─────────────────────────────────────────────────────────────────────────────
+#  -  local_services       Every run: start Hauler + Vault on the admin host,
+#                          initialize/unseal Vault (not a tracked phase)
 #  0  preflight            Validate config+manifest, check BMC/storage reachability
-#  1  bootstrap            Deploy bootstrap VM → start Vault + Artifactory containers
-#  2  vmware               Install ESXi on claimed servers → deploy vCenter → configure
+#  1  vmware               Install ESXi on claimed servers → deploy vCenter → configure
 #                          clusters, dvSwitches, datastores, vVols
+#  2  bootstrap            Deploy bootstrap VM → start Vault + Artifactory containers
 #  3  management_services  Deploy IDM VMs, configure DNS/LDAP/CA; deploy Kea DHCP
-#  4  registry             Deploy mirror registry VM; push all staged images + OLM catalogs
+#  4  mirror_registry      Deploy mirror registry VM; push all staged images + OLM catalogs
 #  5  hub_cluster          Deploy OpenShift Hub (vSphere IPI or Bare-Metal AI/IPI)
 #                          Install Pure CSI driver immediately post-install
-#  6  hub_services         Install operators + deploy all enabled hub services
-#                          Migrate Vault + Artifactory from bootstrap → hub
-#                          Deploy GitLab; wire ArgoCD to GitLab
-#  7  acm                  Configure ACM MultiClusterHub + Assisted Service + InfraEnv
-#  8  spoke_clusters       ZTP spoke deployments (0 to N, order defined below)
-#  9  vdi_services         Deploy VDI pool (vSphere or OCP Virt)
-# 10  validation           End-to-end health checks; emit deployment report
-# 11  bootstrap_teardown   (manual/optional) Decommission bootstrap VM
+#  6  hub_services         Install operators + deploy all enabled hub services (incl. ACM)
+#                          Migrate Vault + Artifactory to the hub; retire local services
+#  7  spoke_clusters       ZTP spoke deployments (0 to N, order defined below)
+#  8  vdi_services         Deploy VDI pool (vSphere or OCP Virt)
+#  9  validation           End-to-end health checks; emit deployment report
+# 10  bootstrap_teardown   (optional) Decommission bootstrap VM
 ##############################################################################
 
 

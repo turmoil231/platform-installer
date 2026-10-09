@@ -12,7 +12,11 @@ Disconnected, bare-metal-to-OpenShift platform deployment tool.
 │  ├── Config Layer (Pydantic)                                    │
 │  │   ├── Loads + validates platform-config.yaml                 │
 │  │   ├── Cross-validates platform-manifest.yaml                 │
-│  │   └── Generates Ansible group_vars + inventory               │
+│  │   └── Generates Ansible extra-vars + inventory               │
+│  │                                                              │
+│  ├── Local Services (podman, every run)                         │
+│  │   ├── Hauler: serves the haul's images + files               │
+│  │   └── Vault: secrets until migrated to the hub cluster       │
 │  │                                                              │
 │  ├── State Layer (SQLite)                                       │
 │  │   ├── Tracks phase completion across runs                    │
@@ -31,7 +35,7 @@ Disconnected, bare-metal-to-OpenShift platform deployment tool.
 │                          ▼                                      │
 │  <state-dir>/ansible-pdd/  (ansible-runner private_data_dir)    │
 │  ├── project/    ← synced copy of ansible/ (playbooks/, ...)    │
-│  ├── vars/       ← generated group_vars-equivalent extra-vars   │
+│  ├── vars/       ← generated extra-vars (every playbook)        │
 │  └── inventory/  ← generated static inventory                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -43,26 +47,35 @@ in at build time), launched via `ansible-runner`'s container executor. See
 
 ## Installation
 
-```bash
-# On the admin server (RHEL 9, Python 3.11+)
-pip install --break-system-packages -e .
+The installer ships as a compiled binary plus a Hauler image tarball; the
+admin server needs podman (or docker), not Python.
 
-# Verify
-platform-installer --help
+```bash
+# Build host (see packaging/)
+./packaging/build_binary.sh
+./packaging/build_hauler_image.sh --hauler-binary /path/to/hauler
+./packaging/build_ansible_image.sh --push-to <registry>   # then add it to the haul
+
+# Admin server (RHEL 9): binary and Hauler tarball in the same directory
+./platform-installer-<version> --help
 ```
+
+For development: `python -m venv .venv && .venv/bin/pip install -e '.[dev]'`,
+then `.venv/bin/pytest`.
 
 ## Prerequisites
 
 | Item | Where |
 |------|-------|
-| `platform-config.yaml` | Working directory |
+| `platform-config.yaml` | Working directory (start from `platform-config.yaml.example`) |
 | `platform-manifest.yaml` | Same directory as config |
-| Rancher Hauler bundle (all staged assets: gold images, ISOs, container images, Helm charts, OLM catalogs, git bundles) | `.tar.zst` file, passed via `--haul-path` on `deploy`/`preflight` |
+| Rancher Hauler bundle (all staged assets, including the Ansible execution image) | `.tar.zst` file, passed via `--haul-path` on `deploy`/`preflight` |
+| Hauler image tarball (`platform-hauler-<version>-container.tar.gz` + `.sha256`) | Next to the installer binary; loaded automatically |
+| podman (preferred) or docker | Admin server |
 | Internal CA cert + key | `global.tls.*` paths |
 | SSH key pair | `global.ssh.*` paths |
 | Merged pull secret | `global.pull_secret_path` |
-| `VAULT_ROLE_ID` env var | Exported before running |
-| `VAULT_SECRET_ID` env var | Exported before running |
+| `VAULT_ROLE_ID` / `VAULT_SECRET_ID` env vars | Hub Vault only, used after `hub_services`. The admin host's local Vault credentials are written by `local/configure_vault.yml` |
 
 ## Usage
 
@@ -75,11 +88,14 @@ platform-installer validate --config platform-config.yaml
 ### Run full deployment
 
 ```bash
-export VAULT_ROLE_ID=<role-id>
-export VAULT_SECRET_ID=<secret-id>
-
 platform-installer deploy --config platform-config.yaml --haul-path ./platform.tar.zst
 ```
+
+Before any phase runs, `deploy` loads the haul into Hauler, starts the Hauler
+registry, Hauler fileserver and Vault containers on the admin host (if they
+aren't already running), and then runs `local/configure_vault.yml` to
+initialize/unseal Vault. This happens on every run until `hub_services` has
+migrated Vault to the hub.
 
 ### Dry run (validates + generates vars, skips Ansible)
 
@@ -178,6 +194,7 @@ platform-installer report --config platform-config.yaml
 
 | Phase | What happens |
 |-------|-------------|
+| `local_services` | Every run, not state-tracked: configure/unseal the admin host's Vault |
 | `preflight` | Validate config, check BMC/storage reachability, verify the Hauler bundle |
 | `vmware` | Install ESXi on claimed servers → deploy vCenter OVA → configure cluster, dvSwitch, datastores |
 | `bootstrap` | Deploy bootstrap VM → start Vault + Artifactory containers → seed both |
@@ -192,59 +209,15 @@ platform-installer report --config platform-config.yaml
 
 ## Project Structure
 
-```
-platform-installer/
-├── installer/
-│   ├── cli.py              # Click CLI — all commands
-│   ├── config/
-│   │   ├── loader.py       # YAML load, manifest check, var + inventory generation
-│   │   └── models.py       # Pydantic v2 models for full config schema
-│   ├── phases/
-│   │   └── base.py         # Phase base class + all phase implementations
-│   ├── runner/
-│   │   └── ansible.py      # ansible-runner wrapper with streaming + retry
-│   └── state/
-│       └── store.py        # SQLite phase state store
-├── ansible/
-│   ├── playbooks/          # One playbook per phase/sub-task
-│   │   ├── preflight.yml
-│   │   ├── vmware/
-│   │   │   ├── install_esxi.yml
-│   │   │   ├── deploy_vcenter.yml
-│   │   │   ├── configure_vcenter.yml
-│   │   │   └── configure_storage.yml
-│   │   ├── bootstrap/
-│   │   ├── management/
-│   │   ├── registry/
-│   │   ├── hub/
-│   │   ├── hub_services/   # One playbook per enabled service
-│   │   ├── spokes/
-│   │   ├── vdi/
-│   │   └── validation/
-│   ├── roles/              # Reusable Ansible roles
-│   │   ├── pure_csi/
-│   │   ├── idm/
-│   │   ├── kea/
-│   │   ├── ocp_install/
-│   │   └── ...
-│   ├── collections/        # Offline collection tarballs (no Galaxy calls)
-│   ├── inventory/
-│   │   └── generated/      # Written by installer — do not edit manually
-│   └── group_vars/
-│       └── generated/      # Written by installer — do not edit manually
-├── vault-policies/         # HCL policies seeded into Vault
-│   ├── platform-installer.hcl
-│   └── ocp-workloads.hcl
-├── platform-config.yaml
-├── platform-manifest.yaml
-└── pyproject.toml
-```
+See the project structure section of `CLAUDE.md`, which is kept current.
 
 ## Adding a New Phase
 
 1. Create a class in `installer/phases/base.py` extending `Phase`
-2. Set `name` and `depends_on`
-3. Implement `run()` calling `self._run_playbook()`
+2. Set `name`, `depends_on` and `success_message`
+3. Implement `planned_playbooks()` returning `PlannedPlaybook`s, decided from
+   config alone (the shared `run()` executes them, and the progress UI is
+   built from the same list)
 4. Optionally implement `health_check()`
 5. Add the class to `ALL_PHASES` at the bottom of `base.py`
 6. Create the corresponding playbook in `ansible/playbooks/`
@@ -258,14 +231,7 @@ platform-installer/
 
 ## Ansible Collections (Disconnected)
 
-All required collections must be pre-staged as tarballs in `ansible/collections/`.
-Do not use `ansible-galaxy install` at deploy time.
-
-Required collections:
-- `ansible.builtin`
-- `community.general`
-- `redhat.rhel_system_roles`
-- `kubernetes.core`
-- `community.vmware`
-- `community.crypto`
-- `ansible.posix`
+Collections are never installed on the admin server or at deploy time. They
+are declared in `ansible/collections/requirements.yml`, staged as tarballs by
+`scripts/stage_collections.sh`, and baked into the Ansible execution image by
+`packaging/build_ansible_image.sh`. See `CLAUDE.md` for the required list.
